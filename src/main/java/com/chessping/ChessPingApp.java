@@ -14,79 +14,113 @@ import javafx.stage.Stage;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-
-import com.chessping.classes.*;
+import com.chessping.networks.*;
+import com.chessping.game.ChessPingGame;
+import com.chessping.game.Ball;
 import java.net.*;
 import java.io.*;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.*;
 import javafx.application.Platform;
+import com.chessping.networks.*;
+import com.chessping.models.pieces.*;
+import com.chessping.models.*;
 
 public class ChessPingApp extends Application {
     
-    private static class PieceInfo {
-        String symbol;
-        int life;
-        boolean isWhite;
-        
-        PieceInfo(String symbol, int life, boolean isWhite) {
-            this.symbol = symbol;
-            this.life = life;
-            this.isWhite = isWhite;
-        }
-    }
-    
     private Stage configStage;
     private AnimationTimer gameTimer;
-    private boolean isGameRunning = false;
     private ToggleButton playPauseButton;
     
     private static final int TILE_SIZE = 85;
-    private static final int VISIBLE_ROWS = 8;
-    
-    private int boardWidth;
-    private Map<String, PieceInfo>[][] boardLife; // Stocke les informations de vie des pièces
-    private String[][] board; // Stocke les symboles des pièces
-    
-    public double whitePaddleX;
-    public double blackPaddleX;
-    public double whitePaddleY = 2*TILE_SIZE + 20;
-    public double blackPaddleY = 6*TILE_SIZE - 35;
     
     private Canvas canvas;
     private Set<KeyCode> pressedKeys = new HashSet<>();
     
-    // ball variables
-    private double ballX = 200;
-    private double ballY = 300;
-    private double ballSpeedX = 5;
-    private double ballSpeedY = 5;
-    private final double BALL_SIZE = 20;
-
     private GameConfig config = new GameConfig();
     private GameServer gameServer;
     private GameClient gameClient;
     private boolean isHost = false;
     private boolean isClientConnected = false;
     private String playerName;
-    private String opponentName = "Adversaire";
-    
-    private double networkWhitePaddleX, networkWhitePaddleY;
-    private double networkBlackPaddleX, networkBlackPaddleY;
-    private double networkBallX, networkBallY;
-    private double networkBallSpeedX, networkBallSpeedY;
-    private boolean isWhitePlayer = true; // Le host joue les blancs par défaut
+    private boolean isWhitePlayer = true;
+    // pour la service de balle
+    private boolean awaitingServe = false;
+    private boolean isAiming = false;
+    private double aimStartX, aimStartY, aimCurrentX, aimCurrentY;
     
     private ExecutorService networkExecutor = Executors.newCachedThreadPool();
+    private ChessPingGame game;
     
     @Override
     public void start(Stage primaryStage) {
         showConfigurationWindow(primaryStage);
     }
-    // 1- fenetre de configuration
+
+    private void setupMouseControls() {
+        canvas.setOnMousePressed(e -> {
+            if (!awaitingServe) return;
+            double mx = e.getX();
+            double my = e.getY();
+            Ball b = game.getBall();
+            double bx = b.getX();
+            double by = b.getY();
+            double size = b.getSize();
+            // Check if click is on the ball
+            if (mx >= bx && mx <= bx + size && my >= by && my <= by + size) {
+                // If we're awaiting a serve and clicked the ball, begin aiming
+                isAiming = true;
+                aimStartX = mx;
+                aimStartY = my;
+                aimCurrentX = mx;
+                aimCurrentY = my;
+            }
+        });
+
+        canvas.setOnMouseDragged(e -> {
+            if (!isAiming) return;
+            aimCurrentX = e.getX();
+            aimCurrentY = e.getY();
+        });
+
+        canvas.setOnMouseReleased(e -> {
+            if (!isAiming) return;
+            isAiming = false;
+            // compute direction vector from ball center to release point
+            Ball b = game.getBall();
+            double bx = b.getX() + b.getSize() / 2;
+            double by = b.getY() + b.getSize() / 2;
+            double dx = aimCurrentX - bx;
+            double dy = aimCurrentY - by;
+            double len = Math.hypot(dx, dy);
+            if (len < 1) return; // avoid zero-length
+            double nx = dx / len;
+            double ny = dy / len;
+
+            // scale to desired initial speed
+            double speed = 4.0; // can adjust
+            double vx = nx * speed;
+            double vy = ny * speed;
+
+            // If local mode or host, perform launch authoritatively; if network client, send request to host
+            if (config.networkConfig.getMode() == GameMode.LOCAL || isHost) {
+                launchBall(vx, vy, isWhitePlayer);
+                // broadcast immediately so clients see the launch without wait
+                if (gameServer != null) {
+                    GameState gs = createGameState();
+                    gameServer.broadcastGameState(gs);
+                }
+            } else {
+                // Network Client: send a ServeRequest to server
+                if (gameClient != null) {
+                    ServeRequest req = new ServeRequest(vx, vy, isWhitePlayer, playerName);
+                    gameClient.sendServeRequest(req);
+                }
+            }
+        });
+    }
+    
     private void showConfigurationWindow(Stage mainStage) {
         configStage = new Stage();
         configStage.setTitle("Configuration du ChessPing");
@@ -304,232 +338,114 @@ public class ChessPingApp extends Application {
         configStage.setScene(configScene);
         configStage.showAndWait();
     }
-
-    private void showAlert(String title, String header, String content) {
-        Alert alert = new Alert(Alert.AlertType.ERROR);
-        alert.setTitle(title);
-        alert.setHeaderText(header);
-        alert.setContentText(content);
-        alert.showAndWait();
-    }
     
     private void startGame(Stage stage) {
-
         playerName = config.networkConfig.getPlayerName();
+        
+        // Créer le jeu
+        game = new ChessPingGame(config, TILE_SIZE);
+        
+        // Configurer réseau
         if (config.networkConfig.getMode() == GameMode.HOST) {
             isHost = true;
             isWhitePlayer = true;
+            game.setWhitePlayerName(playerName);
             startGameServer(config.networkConfig.getPort());
         } else if (config.networkConfig.getMode() == GameMode.JOIN) {
             isHost = false;
-            isWhitePlayer = false; // Le client joue les noirs
+            isWhitePlayer = false;
+            game.setBlackPlayerName(playerName);
             connectToGameServer(config.networkConfig.getServerIp(), config.networkConfig.getPort());
-        }
-
-        boardWidth = config.pieceLevel;
-        board = new String[8][boardWidth];
-        boardLife = new HashMap[8][boardWidth];
-        
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < boardWidth; j++) {
-                boardLife[i][j] = new HashMap<>();
-            }
+        } else {
+            // Mode local
+            game.setWhitePlayerName("Joueur 1");
+            game.setBlackPlayerName("Joueur 2");
         }
         
-        canvas = new Canvas(boardWidth * TILE_SIZE, 8 * TILE_SIZE);
-        
-        initializeBoard();
-        whitePaddleX = (boardWidth - 1) / 2.0;
-        blackPaddleX = (boardWidth - 1) / 2.0;
+        // Configuration de l'interface
+        canvas = new Canvas(config.pieceLevel * TILE_SIZE, 8 * TILE_SIZE);
         
         BorderPane root = new BorderPane();
-        
-        // Panel gauche avec configurations et boutons
         VBox leftPanel = createLeftPanel();
         root.setLeft(leftPanel);
         root.setCenter(canvas);
         
         Scene scene = new Scene(root, 1200, 700);
-        
-        scene.setOnKeyPressed(e -> pressedKeys.add(e.getCode()));
-        scene.setOnKeyReleased(e -> pressedKeys.remove(e.getCode()));
+        setupKeyControls(scene);
+        setupMouseControls();
         
         stage.setTitle("ChessPing Game - " + (config.isNetworkMode() ? "Mode Réseau" : "Mode Local"));
         stage.setScene(scene);
         stage.show();
-        // Ensure network resources are closed when window is closed
-        stage.setOnCloseRequest(ev -> {
-            if (gameServer != null) {
-                try { gameServer.stop(); } catch (Exception ignored) {}
-            }
-            if (gameClient != null) {
-                try { gameClient.disconnect(); } catch (Exception ignored) {}
-            }
-            networkExecutor.shutdownNow();
-        });
-        scene.getRoot().requestFocus();
+        setupStageCloseHandler(stage);
         
-        drawBoard(canvas.getGraphicsContext2D());
-        // Use event filters so arrow keys and other keys are captured even
-            // when some controls have focus (prevents focus traversal from swallowing keys).
-            scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
-                pressedKeys.add(e.getCode());
-                // Ensure canvas has focus when any game control key is pressed
-                if (canvas != null && (e.getCode() == KeyCode.LEFT || e.getCode() == KeyCode.RIGHT || 
-                    e.getCode() == KeyCode.UP || e.getCode() == KeyCode.DOWN ||
-                    e.getCode() == KeyCode.W || e.getCode() == KeyCode.Z ||
-                    e.getCode() == KeyCode.A || e.getCode() == KeyCode.Q ||
-                    e.getCode() == KeyCode.S || e.getCode() == KeyCode.D)) {
-                    canvas.requestFocus();
-                    // If we're a connected client, immediately update our local paddle
-                    // and send the update to the host so the other side sees it even
-                    // if Play hasn't been pressed locally.
-                    if (config.isNetworkMode() && !isHost && isClientConnected) {
-                        double speed = 0.12;
-                        KeyCode code = e.getCode();
-                        if (isWhitePlayer) {
-                            if (code == KeyCode.A || code == KeyCode.Q) {
-                                whitePaddleX = Math.max(0, whitePaddleX - speed);
-                            } else if (code == KeyCode.D) {
-                                whitePaddleX = Math.min(boardWidth - 1, whitePaddleX + speed);
-                            } else if (code == KeyCode.W || code == KeyCode.Z) {
-                                if (whitePaddleY - speed * TILE_SIZE > (TILE_SIZE * 2) -20) {
-                                    whitePaddleY -= speed * TILE_SIZE;
-                                }
-                            } else if (code == KeyCode.S) {
-                                if (whitePaddleY + speed * TILE_SIZE + 15 < (TILE_SIZE * 2) + 50) {
-                                    whitePaddleY += speed * TILE_SIZE;
-                                }
-                            }
-                        } else {
-                            if (code == KeyCode.LEFT) {
-                                blackPaddleX = Math.max(0, blackPaddleX - speed);
-                            } else if (code == KeyCode.RIGHT) {
-                                blackPaddleX = Math.min(boardWidth - 1, blackPaddleX + speed);
-                            } else if (code == KeyCode.UP) {
-                                if (blackPaddleY - speed * TILE_SIZE > 445) {
-                                    blackPaddleY -= speed * TILE_SIZE;
-                                }
-                            } else if (code == KeyCode.DOWN) {
-                                if (blackPaddleY + speed * TILE_SIZE + 15 < 505) {
-                                    blackPaddleY += speed * TILE_SIZE;
-                                }
-                            }
-                        }
-
-                        double sx = isWhitePlayer ? whitePaddleX : blackPaddleX;
-                        double sy = isWhitePlayer ? whitePaddleY : blackPaddleY;
-                        sendPaddleUpdate(sx, sy, isWhitePlayer);
-                    }
-                }
-            });
-            scene.addEventFilter(KeyEvent.KEY_RELEASED, e -> pressedKeys.remove(e.getCode()));
-
-            // Also attach the same filters to the canvas so keys are captured when
-            // the canvas has focus (robust against focus changes in the left panel).
-            canvas.addEventFilter(KeyEvent.KEY_PRESSED, e -> pressedKeys.add(e.getCode()));
-            canvas.addEventFilter(KeyEvent.KEY_RELEASED, e -> pressedKeys.remove(e.getCode()));
+        drawGame();
     }
     
-    // 1) creation de panel gauche
-    private VBox createLeftPanel() {
-        VBox vb = new VBox(15);
-        vb.setPadding(new Insets(20));
-        vb.setPrefWidth(300);
-        vb.setStyle("-fx-background-color: #eae3d94c;");
+    private void setupKeyControls(Scene scene) {
+        scene.setOnKeyPressed(e -> pressedKeys.add(e.getCode()));
+        scene.setOnKeyReleased(e -> pressedKeys.remove(e.getCode()));
         
-        // Affichage des configurations
-        VBox configInfo = new VBox(5);
-        configInfo.setStyle("-fx-background-color: #2c3e50; -fx-padding: 10; -fx-background-radius: 5;");
-
-        String modeText = config.isNetworkMode() ? "Mode Réseau" : "Mode Local";
-        String lifeText = String.format("Roi:%d | Reine:%d | Cavalier:%d | Pion:%d",
-            config.kingLife, config.queenLife, config.knightLife, config.pawnLife);
-
-        configInfo.getChildren().addAll(
-            createInfoText("Configuration actuelle:"),
-            createInfoText("Pièces: " + config.pieceLevel),
-            createInfoText(modeText),
-            createInfoText("Vies: " + lifeText),
-            createInfoText("Contrôles:"),
-            createInfoText("Haut: ZQSD"),
-            createInfoText("Bas: Flèches")
-        );
+        scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
+            pressedKeys.add(e.getCode());
+            handleKeyPress(e.getCode());
+        });
         
-        // Infos joueurs
-        VBox players = new VBox(5);
-        players.setStyle("-fx-background-color: #444; -fx-padding: 10; -fx-background-radius: 5;");
-        
-        // Boutons de contrôle en bas du panel gauche
-        VBox controlButtons = createControlButtons();
-        controlButtons.setStyle("-fx-padding: 20 0 0 0;");
-        
-        // Bouton pour reconfigurer
-        Button reconfigBtn = new Button("Reconfigurer");
-        reconfigBtn.setPrefWidth(150);
-        reconfigBtn.setOnAction(e -> showConfigurationWindow((Stage)canvas.getScene().getWindow()));
-        
-        vb.getChildren().addAll(    
-            configInfo,
-            javafxText("-------------------------"),
-            javafxText("Statistiques joueurs :"),
-            players,
-            javafxText("-------------------------"),
-            controlButtons,
-            reconfigBtn
-        );
-        
-        return vb;
+        canvas.addEventFilter(KeyEvent.KEY_PRESSED, e -> pressedKeys.add(e.getCode()));
+        canvas.addEventFilter(KeyEvent.KEY_RELEASED, e -> pressedKeys.remove(e.getCode()));
     }
-    // Les boutons de controls (play , restart , load)
-    private VBox createControlButtons() {
-        VBox buttonBox = new VBox(10);
+    
+    private void handleKeyPress(KeyCode code) {
+        double speed = 0.20 * TILE_SIZE;
         
-        // Bouton Play/Pause
-        playPauseButton = new ToggleButton("Play");
-        playPauseButton.setPrefWidth(150);
-        playPauseButton.setStyle("-fx-background-color: #4CAF50; -fx-text-fill: white; -fx-font-size: 14px;");
-        
-        playPauseButton.setOnAction(e -> {
-            if (playPauseButton.isSelected()) {
-                playPauseButton.setText("Pause");
-                playPauseButton.setStyle("-fx-background-color: #ff9800; -fx-text-fill: white; -fx-font-size: 14px;");
-                startGameAnimation();
-                // Ensure the canvas has focus when the game starts so key input works
-                if (canvas != null) {
-                    canvas.setFocusTraversable(true);
-                    canvas.requestFocus();
+        if (config.networkConfig.getMode() == GameMode.LOCAL || isHost) {
+            // Contrôles locaux ou host
+            if (code == KeyCode.A || code == KeyCode.Q) {
+                game.moveWhitePaddle(-speed, 0);
+            } else if (code == KeyCode.D) {
+                game.moveWhitePaddle(speed, 0);
+            } else if (code == KeyCode.W || code == KeyCode.Z) {
+                game.moveWhitePaddle(0, -speed);
+            } else if (code == KeyCode.S) {
+                game.moveWhitePaddle(0, speed);
+            } else if (code == KeyCode.LEFT) {
+                game.moveBlackPaddle(-speed, 0);
+            } else if (code == KeyCode.RIGHT) {
+                game.moveBlackPaddle(speed, 0);
+            } else if (code == KeyCode.UP) {
+                game.moveBlackPaddle(0, -speed);
+            } else if (code == KeyCode.DOWN) {
+                game.moveBlackPaddle(0, speed);
+            }
+        } else if (isClientConnected) {
+            // Client réseau
+            if (isWhitePlayer) {
+                if (code == KeyCode.A || code == KeyCode.Q) {
+                    game.moveWhitePaddle(-speed, 0);
+                } else if (code == KeyCode.D) {
+                    game.moveWhitePaddle(speed, 0);
+                } else if (code == KeyCode.W || code == KeyCode.Z) {
+                    game.moveWhitePaddle(0, -speed);
+                } else if (code == KeyCode.S) {
+                    game.moveWhitePaddle(0, speed);
                 }
-                isGameRunning = true;
             } else {
-                playPauseButton.setText("Play");
-                playPauseButton.setStyle("-fx-background-color: #4CAF50; -fx-text-fill: white; -fx-font-size: 14px;");
-                if (gameTimer != null) {
-                    gameTimer.stop();
+                if (code == KeyCode.LEFT) {
+                    game.moveBlackPaddle(-speed, 0);
+                } else if (code == KeyCode.RIGHT) {
+                    game.moveBlackPaddle(speed, 0);
+                } else if (code == KeyCode.UP) {
+                    game.moveBlackPaddle(0, -speed);
+                } else if (code == KeyCode.DOWN) {
+                    game.moveBlackPaddle(0, speed);
                 }
-                isGameRunning = false;
             }
-        });
+        }
         
-        Button restart = new Button("Restart");
-        restart.setPrefWidth(150);
-        restart.setOnAction(e -> {
-            if (gameTimer != null) {
-                gameTimer.stop();
-            }
-            isGameRunning = false;
-            playPauseButton.setSelected(false);
-            playPauseButton.setText("Play");
-            playPauseButton.setStyle("-fx-background-color: #4CAF50; -fx-text-fill: white; -fx-font-size: 14px;");
-            recreateBoard();
-        });
-        
-        Button load = new Button("Load");
-        load.setPrefWidth(150);
-        load.setOnAction(e -> System.out.println("Load clicked"));
-        
-        buttonBox.getChildren().addAll(playPauseButton, restart, load);
-        return buttonBox;
+        // Envoyer mise à jour réseau si nécessaire
+        if (config.isNetworkMode() && !isHost && isClientConnected) {
+            sendPaddleUpdate();
+        }
     }
     
     private void startGameAnimation() {
@@ -539,31 +455,31 @@ public class ChessPingApp extends Application {
             
             @Override
             public void handle(long now) {
-                if (!isGameRunning) return;
-                
+                // Allow animation to run either while game is running or while awaiting a serve
+                if (!game.isGameRunning() && !awaitingServe) return;
+
                 if (now - last < 16_000_000) return;
                 last = now;
-                
-                double speed = 0.12;
 
-                // Gestion des contrôles selon le mode
-                handleControls(speed);
-                
-                // Si on est host ou en local, mettre à jour la balle et les collisions
-                if (isHost || config.networkConfig.getMode() == GameMode.LOCAL) {
-                    updateBall();
+                if (game.isGameRunning()) {
+                    // Mettre à jour le jeu
+                    game.update();
+
+                    // Vérifier fin de partie
+                    if (game.checkGameOver()) {
+                        game.setGameRunning(false);
+                        awaitingServe = false;
+                        playPauseButton.setSelected(false);
+                        playPauseButton.setText("Play");
+                        drawGameOver();
+                    }
                 }
-                
-                drawBoard(canvas.getGraphicsContext2D());
-                drawBall(canvas.getGraphicsContext2D());
-                
-                // Vérifier si un roi est mort (uniquement pour le host)
-                if (isHost || config.networkConfig.getMode() == GameMode.LOCAL) {
-                    checkKingStatus(canvas.getGraphicsContext2D());
-                }
-                
-                // Synchroniser avec le réseau (toutes les 50ms)
-                if (config.networkConfig.getMode() != GameMode.LOCAL) {
+
+                // Dessiner (also when awaiting serve so aim overlay appears)
+                drawGame();
+
+                // Synchronisation réseau
+                if (config.isNetworkMode()) {
                     if (now - lastNetworkUpdate > 50_000_000) {
                         updateNetworkGameState();
                         lastNetworkUpdate = now;
@@ -573,484 +489,46 @@ public class ChessPingApp extends Application {
         };
         gameTimer.start();
     }
-
-    private void handleControls(double speed) {
-        if (config.networkConfig.getMode() == GameMode.LOCAL) {
-            handleLocalControls(speed);
-        } else if (isHost) {
-            handleHostControls(speed);
-        } else if (isClientConnected) {
-            handleClientControls(speed);
-        }
-    }
-
-    private void handleLocalControls(double speed) {
-        // Raquette blanche (HAUT) - Supporte AZERTY (ZQSD) et QWERTY (WASD)
-        if (pressedKeys.contains(KeyCode.A) || pressedKeys.contains(KeyCode.Q)) {
-            whitePaddleX = Math.max(0, whitePaddleX - speed);
-        }
-        if (pressedKeys.contains(KeyCode.D)) {
-            whitePaddleX = Math.min(boardWidth - 1, whitePaddleX + speed);
-        }
-        if (pressedKeys.contains(KeyCode.W) || pressedKeys.contains(KeyCode.Z)) {
-            if(whitePaddleY - speed * TILE_SIZE > (TILE_SIZE * 2) -20){
-                whitePaddleY -= speed * TILE_SIZE;
-            }
-        }
-        if (pressedKeys.contains(KeyCode.S)) {
-            if(whitePaddleY + speed * TILE_SIZE + 15 < (TILE_SIZE * 2) + 50){
-                whitePaddleY += speed * TILE_SIZE;
-            }
-        }
-        
-        // Raquette noire (BAS) - Contrôles flèches
-        if (pressedKeys.contains(KeyCode.LEFT)) {
-            blackPaddleX = Math.max(0, blackPaddleX - speed);
-        }
-        if (pressedKeys.contains(KeyCode.RIGHT)) {
-            blackPaddleX = Math.min(boardWidth - 1, blackPaddleX + speed);
-        }
-        if (pressedKeys.contains(KeyCode.UP)) {
-            if(blackPaddleY - speed * TILE_SIZE > 445){
-                blackPaddleY -= speed * TILE_SIZE;
-            }
-        }
-        if (pressedKeys.contains(KeyCode.DOWN)) {
-            if(blackPaddleY + speed * TILE_SIZE + 15 < 505){
-                blackPaddleY += speed * TILE_SIZE;
-            }
-        }
-    }
-
-    private void handleHostControls(double speed) {
-        // Le host contrôle seulement la raquette blanche
-        if (pressedKeys.contains(KeyCode.A) || pressedKeys.contains(KeyCode.Q)) {
-            whitePaddleX = Math.max(0, whitePaddleX - speed);
-        }
-        if (pressedKeys.contains(KeyCode.D)) {
-            whitePaddleX = Math.min(boardWidth - 1, whitePaddleX + speed);
-        }
-        if (pressedKeys.contains(KeyCode.W) || pressedKeys.contains(KeyCode.Z)) {
-            if(whitePaddleY - speed * TILE_SIZE > (TILE_SIZE * 2) -20){
-                whitePaddleY -= speed * TILE_SIZE;
-            }
-        }
-        if (pressedKeys.contains(KeyCode.S)) {
-            if(whitePaddleY + speed * TILE_SIZE + 15 < (TILE_SIZE * 2) + 50){
-                whitePaddleY += speed * TILE_SIZE;
-            }
-        }
-    }
-
-    private void handleClientControls(double speed) {
-        // Le client contrôle seulement sa raquette assignée
-        if (isWhitePlayer) {
-            // Contrôle raquette bl
-            if (pressedKeys.contains(KeyCode.A) || pressedKeys.contains(KeyCode.Q)) {
-                whitePaddleX = Math.max(0, whitePaddleX - speed);
-            }
-            if (pressedKeys.contains(KeyCode.D)) {
-                whitePaddleX = Math.min(boardWidth - 1, whitePaddleX + speed);
-            }
-            if (pressedKeys.contains(KeyCode.W) || pressedKeys.contains(KeyCode.Z)) {
-                if(whitePaddleY - speed * TILE_SIZE > (TILE_SIZE * 2) -20){
-                    whitePaddleY -= speed * TILE_SIZE;
-                }
-            }
-            if (pressedKeys.contains(KeyCode.S)) {
-                if(whitePaddleY + speed * TILE_SIZE + 15 < (TILE_SIZE * 2) + 50){
-                    whitePaddleY += speed * TILE_SIZE;
-                }
-            }
-        } else {
-            // Contrôle raquette noire
-            if (pressedKeys.contains(KeyCode.LEFT)) {
-                blackPaddleX = Math.max(0, blackPaddleX - speed);
-            }
-            if (pressedKeys.contains(KeyCode.RIGHT)) {
-                blackPaddleX = Math.min(boardWidth - 1, blackPaddleX + speed);
-            }
-            if (pressedKeys.contains(KeyCode.UP)) {
-                if(blackPaddleY - speed * TILE_SIZE > 445){
-                    blackPaddleY -= speed * TILE_SIZE;
-                }
-            }
-            if (pressedKeys.contains(KeyCode.DOWN)) {
-                if(blackPaddleY + speed * TILE_SIZE + 15 < 505){
-                    blackPaddleY += speed * TILE_SIZE;
-                }
-            }
-        }
-    }
-        
-    // RECRÉATION DU PLATEAU
-    private void recreateBoard() {
-        boardWidth = config.pieceLevel;
-        board = new String[8][boardWidth];
-        boardLife = new HashMap[8][boardWidth];
-        
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < boardWidth; j++) {
-                boardLife[i][j] = new HashMap<>();
-            }
-        }
-        
-        canvas.setWidth(boardWidth * TILE_SIZE);
-        
-        // Réinitialiser la position de la balle
-        ballX = canvas.getWidth() / 2;
-        ballY = canvas.getHeight() / 2;
-        ballSpeedX = 3;
-        ballSpeedY = 3;
-        
-        whitePaddleX = (boardWidth - 1) / 2.0;
-        blackPaddleX = (boardWidth - 1) / 2.0;
-        
-        initializeBoard();
-        drawBoard(canvas.getGraphicsContext2D());
-        // After drawing, if we're a host and server is running, send initial state to any clients
-        // (GameServer will also broadcast periodically). If we are client, nothing to do here.
-    }
-
-    // Create a snapshot GameState representing current game and configuration
-    public GameState createGameState() {
-        GameState gs = new GameState();
-        gs.whitePaddleX = this.whitePaddleX;
-        gs.whitePaddleY = this.whitePaddleY;
-        gs.blackPaddleX = this.blackPaddleX;
-        gs.blackPaddleY = this.blackPaddleY;
-        gs.ballX = this.ballX;
-        gs.ballY = this.ballY;
-        gs.ballSpeedX = this.ballSpeedX;
-        gs.ballSpeedY = this.ballSpeedY;
-        gs.gameRunning = this.isGameRunning;
-        gs.whiteScore = 0;
-        gs.blackScore = 0;
-        // configuration
-        gs.pieceLevel = this.config.pieceLevel;
-        gs.kingLife = this.config.kingLife;
-        gs.queenLife = this.config.queenLife;
-        gs.knightLife = this.config.knightLife;
-        gs.pawnLife = this.config.pawnLife;
-        
-        // Serialize board state
-        if (this.board != null) {
-            gs.boardPieces = new String[this.board.length][];
-            for (int i = 0; i < this.board.length; i++) {
-                gs.boardPieces[i] = new String[this.board[i].length];
-                System.arraycopy(this.board[i], 0, gs.boardPieces[i], 0, this.board[i].length);
-            }
-        }
-        
-        // Serialize piece life information
-        if (this.boardLife != null) {
-            gs.piecesLife = new GameState.PieceLifeInfo[this.boardLife.length][];
-            for (int i = 0; i < this.boardLife.length; i++) {
-                gs.piecesLife[i] = new GameState.PieceLifeInfo[this.boardLife[i].length];
-                for (int j = 0; j < this.boardLife[i].length; j++) {
-                    if (this.boardLife[i][j] != null && this.boardLife[i][j].containsKey("symbol")) {
-                        PieceInfo p = this.boardLife[i][j].get("symbol");
-                        gs.piecesLife[i][j] = new GameState.PieceLifeInfo(p.symbol, p.life, p.isWhite);
-                    }
-                }
-            }
-        }
-        
-        return gs;
-    }
-    // INITIALISATION DES PIÈCES AVEC VIE
-    private void initializeBoard() {
-        for (int i = 0; i < 8; i++)
-            for (int j = 0; j < boardWidth; j++) {
-                board[i][j] = null;
-                boardLife[i][j].clear();
-            }
-        
-        if (config.pieceLevel == 2) {
-            board[0][0] = "♕"; boardLife[0][0].put("symbol", new PieceInfo("♕", config.queenLife, true));
-            board[0][1] = "♔"; boardLife[0][1].put("symbol", new PieceInfo("♔", config.kingLife, true));
-            board[7][0] = "♛"; boardLife[7][0].put("symbol", new PieceInfo("♛", config.queenLife, false));
-            board[7][1] = "♚"; boardLife[7][1].put("symbol", new PieceInfo("♚", config.kingLife, false));
-            board[1][0] = board[1][1] = "♙"; 
-            boardLife[1][0].put("symbol", new PieceInfo("♙", config.pawnLife, true));
-            boardLife[1][1].put("symbol", new PieceInfo("♙", config.pawnLife, true));
-            board[6][0] = board[6][1] = "♟";
-            boardLife[6][0].put("symbol", new PieceInfo("♟", config.pawnLife, false));
-            boardLife[6][1].put("symbol", new PieceInfo("♟", config.pawnLife, false));
-            
-        } else if (config.pieceLevel == 4) {
-            for (int i = 0; i < 4; i++) {
-                board[1][i] = "♙";
-                boardLife[1][i].put("symbol", new PieceInfo("♙", config.pawnLife, true));
-                board[6][i] = "♟";
-                boardLife[6][i].put("symbol", new PieceInfo("♟", config.pawnLife, false));
-            }
-            board[0][0] = "♗"; boardLife[0][0].put("symbol", new PieceInfo("♗", 3, true));
-            board[0][1] = "♕"; boardLife[0][1].put("symbol", new PieceInfo("♕", config.queenLife, true));
-            board[0][2] = "♔"; boardLife[0][2].put("symbol", new PieceInfo("♔", config.kingLife, true));
-            board[0][3] = "♗"; boardLife[0][3].put("symbol", new PieceInfo("♗", 3, true));
-            board[7][0] = "♝"; boardLife[7][0].put("symbol", new PieceInfo("♝", 3, false));
-            board[7][1] = "♛"; boardLife[7][1].put("symbol", new PieceInfo("♛", config.queenLife, false));
-            board[7][2] = "♚"; boardLife[7][2].put("symbol", new PieceInfo("♚", config.kingLife, false));
-            board[7][3] = "♝"; boardLife[7][3].put("symbol", new PieceInfo("♝", 3, false));
-            
-        } else if (config.pieceLevel == 6) {
-            for (int i = 0; i < 6; i++) {
-                board[1][i] = "♙";
-                boardLife[1][i].put("symbol", new PieceInfo("♙", config.pawnLife, true));
-                board[6][i] = "♟";
-                boardLife[6][i].put("symbol", new PieceInfo("♟", config.pawnLife, false));
-            }
-            board[0][0] = "♘"; boardLife[0][0].put("symbol", new PieceInfo("♘", config.knightLife, true));
-            board[0][1] = "♗"; boardLife[0][1].put("symbol", new PieceInfo("♗", 3, true));
-            board[0][2] = "♕"; boardLife[0][2].put("symbol", new PieceInfo("♕", config.queenLife, true));
-            board[0][3] = "♔"; boardLife[0][3].put("symbol", new PieceInfo("♔", config.kingLife, true));
-            board[0][4] = "♗"; boardLife[0][4].put("symbol", new PieceInfo("♗", 3, true));
-            board[0][5] = "♘"; boardLife[0][5].put("symbol", new PieceInfo("♘", config.knightLife, true));
-            board[7][0] = "♞"; boardLife[7][0].put("symbol", new PieceInfo("♞", config.knightLife, false));
-            board[7][1] = "♝"; boardLife[7][1].put("symbol", new PieceInfo("♝", 3, false));
-            board[7][2] = "♛"; boardLife[7][2].put("symbol", new PieceInfo("♛", config.queenLife, false));
-            board[7][3] = "♚"; boardLife[7][3].put("symbol", new PieceInfo("♚", config.kingLife, false));
-            board[7][4] = "♝"; boardLife[7][4].put("symbol", new PieceInfo("♝", 3, false));
-            board[7][5] = "♞"; boardLife[7][5].put("symbol", new PieceInfo("♞", config.knightLife, false));
-            
-        } else if (config.pieceLevel == 8) {
-            for (int i = 0; i < 8; i++) {
-                board[1][i] = "♙";
-                boardLife[1][i].put("symbol", new PieceInfo("♙", config.pawnLife, true));
-                board[6][i] = "♟";
-                boardLife[6][i].put("symbol", new PieceInfo("♟", config.pawnLife, false));
-            }
-            board[0] = new String[]{"♖","♘","♗","♕","♔","♗","♘","♖"};
-            boardLife[0][0].put("symbol", new PieceInfo("♖", 3, true));
-            boardLife[0][1].put("symbol", new PieceInfo("♘", config.knightLife, true));
-            boardLife[0][2].put("symbol", new PieceInfo("♗", 3, true));
-            boardLife[0][3].put("symbol", new PieceInfo("♕", config.queenLife, true));
-            boardLife[0][4].put("symbol", new PieceInfo("♔", config.kingLife, true));
-            boardLife[0][5].put("symbol", new PieceInfo("♗", 3, true));
-            boardLife[0][6].put("symbol", new PieceInfo("♘", config.knightLife, true));
-            boardLife[0][7].put("symbol", new PieceInfo("♖", 3, true));
-            
-            board[7] = new String[]{"♜","♞","♝","♛","♚","♝","♞","♜"};
-            boardLife[7][0].put("symbol", new PieceInfo("♜", 3, false));
-            boardLife[7][1].put("symbol", new PieceInfo("♞", config.knightLife, false));
-            boardLife[7][2].put("symbol", new PieceInfo("♝", 3, false));
-            boardLife[7][3].put("symbol", new PieceInfo("♛", config.queenLife, false));
-            boardLife[7][4].put("symbol", new PieceInfo("♚", config.kingLife, false));
-            boardLife[7][5].put("symbol", new PieceInfo("♝", 3, false));
-            boardLife[7][6].put("symbol", new PieceInfo("♞", config.knightLife, false));
-            boardLife[7][7].put("symbol", new PieceInfo("♜", 3, false));
-        }
-    }
     
-    //RENDU DU PLATEAU AVEC VIE
-    private void drawBoard(GraphicsContext gc) {
-        gc.clearRect(0, 0, canvas.getWidth(), canvas.getHeight());
-        drawTiles(gc, 0, 2);
-        drawMiddle(gc);
-        drawTiles(gc, 6, 8);
-        drawPaddles(gc);
-        drawCoordinates(gc);
-        drawPieces(gc);
-        drawBall(gc);
-    }
-    
-    private void drawTiles(GraphicsContext gc, int startRow, int endRow) {
-        Color lightSquare = Color.rgb(245, 245, 220);
-        Color darkSquare  = Color.rgb(222, 184, 135);
-        for (int row = startRow; row < endRow; row++) {
-            for (int col = 0; col < boardWidth; col++) {
-                boolean light = (row + col) % 2 == 0;
-                gc.setFill(light ? lightSquare : darkSquare);
-                gc.fillRect(col * TILE_SIZE, row * TILE_SIZE, TILE_SIZE, TILE_SIZE);
-            }
-        }
-    }
-    
-    private void drawMiddle(GraphicsContext gc) {
-        gc.setFill(Color.web("#fff"));
-        gc.fillRect(0, TILE_SIZE * 2, boardWidth * TILE_SIZE, TILE_SIZE * 4);
-    }
-    
-    private void drawPaddles(GraphicsContext gc) {
-        double paddleWidth = TILE_SIZE * 1.5;
-        double paddleHeight = 15;
-        
-        double pxW = whitePaddleX * TILE_SIZE + TILE_SIZE / 2 - paddleWidth / 2;
-        gc.setFill(Color.RED);
-        gc.fillRoundRect(pxW, whitePaddleY, paddleWidth, paddleHeight, 5, 5);
-        
-        double pxB = blackPaddleX * TILE_SIZE + TILE_SIZE / 2 - paddleWidth / 2;
-        gc.setFill(Color.DARKBLUE);
-        gc.fillRoundRect(pxB, blackPaddleY, paddleWidth, paddleHeight, 5, 5);
-    }
-    
-    private void drawCoordinates(GraphicsContext gc) {
-        gc.setFont(Font.font(14));
-        gc.setFill(Color.GREY);
-        
-        for (int i = 0; i < boardWidth; i++)
-            gc.fillText("" + (char)('a'+i), i*TILE_SIZE + 5, 8*TILE_SIZE - 5);
-        
-        gc.setFill(Color.BLACK);
-        for (int i = 0; i < 8; i++)
-            gc.fillText("" + (8-i), 5, i*TILE_SIZE + 15);
-    }
-    
-    private void drawPieces(GraphicsContext gc) {
-        gc.setFont(Font.font(60));
-        
-        for (int row = 0; row < 8; row++) {
-            for (int col = 0; col < boardWidth; col++) {
-                if (board[row][col] != null) {
-                    // Déterminer la couleur de la pièce
-                    if (boardLife[row][col].containsKey("symbol")) {
-                        PieceInfo piece = boardLife[row][col].get("symbol");
-                        gc.setFill(piece.isWhite ? Color.BLACK : Color.GRAY);
-                    } else {
-                        gc.setFill(Color.BLACK);
-                    }
-                    
-                    gc.fillText(board[row][col], col*TILE_SIZE + 10, row*TILE_SIZE + 60);
-                    
-                    // Afficher la vie de la pièce dans un cercle
-                    if (boardLife[row][col].containsKey("symbol")) {
-                        PieceInfo piece = boardLife[row][col].get("symbol");
-                        if (piece.life > 0) {
-                            // Position du cercle en bas à droite
-                            double circleX = col * TILE_SIZE + TILE_SIZE - 20;
-                            double circleY = row * TILE_SIZE + TILE_SIZE - 20;
-                            double radius = 8;
-                            
-                            if (piece.life <= 1) {
-                                gc.setFill(Color.RED);
-                            } else {
-                                gc.setFill(Color.GREEN);
-                            }
-                            
-                            // Dessiner le cercle
-                            gc.fillOval(circleX, circleY, radius * 2, radius * 2);
-                            
-                            // Texte de la vie au centre du cercle
-                            gc.setFont(Font.font(10));
-                            gc.setFill(Color.WHITE);
-                            String lifeText = "" + piece.life;
-                            gc.fillText(lifeText, circleX + radius - 4, circleY + radius + 4);
-                            
-                            gc.setFont(Font.font(40)); // Réinitialiser
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    private void drawBall(GraphicsContext gc) {
-        gc.setFill(Color.YELLOW);
-        gc.fillOval(ballX, ballY, BALL_SIZE, BALL_SIZE);
-    }
-    
-    private void updateBall() {
-        if (!isGameRunning) return;
-        
-        ballX += ballSpeedX;
-        ballY += ballSpeedY;
-        
-        double width = canvas.getWidth();
-        double height = canvas.getHeight();
-        
-        if (ballX <= 0 || ballX + BALL_SIZE >= width) ballSpeedX *= -1;
-        
-        double pw = TILE_SIZE * 1.5;
-        double ph = 15;
-        double paddleTopX = whitePaddleX * TILE_SIZE + TILE_SIZE/2 - pw/2;
-        
-        if (ballY <= whitePaddleY + ph &&
-            ballY + BALL_SIZE >= whitePaddleY &&
-            ballX + BALL_SIZE >= paddleTopX &&
-            ballX <= paddleTopX + pw) {
-            
-            if (ballSpeedY < 0) {
-                ballSpeedY = Math.abs(ballSpeedY);
-                ballY = whitePaddleY + ph + 1;
-            }
-        }
-        
-        double paddleBotX = blackPaddleX * TILE_SIZE + TILE_SIZE/2 - pw/2;
-        
-        if (ballY + BALL_SIZE >= blackPaddleY &&
-            ballY <= blackPaddleY + ph &&
-            ballX + BALL_SIZE >= paddleBotX &&
-            ballX <= paddleBotX + pw) {
-            
-            if (ballSpeedY > 0) {
-                ballSpeedY = -Math.abs(ballSpeedY);
-                ballY = blackPaddleY - BALL_SIZE - 1;
-            }
-        }
-        
-        // Collision avec les pièces
-        int col = (int)(ballX / TILE_SIZE);
-        int row = (int)(ballY / TILE_SIZE);
-        
-        if (row >= 0 && row < 8 && col >= 0 && col < boardWidth) {
-            if (board[row][col] != null && boardLife[row][col].containsKey("symbol")) {
-                PieceInfo piece = boardLife[row][col].get("symbol");
-                piece.life--;
-                
-                if (piece.life <= 0) {
-                    // Pièce détruite
-                    board[row][col] = null;
-                    boardLife[row][col].clear();
-                }
-                
-                ballSpeedY *= -1;
-                ballSpeedX += (Math.random() - 0.5) * 0.4;
-                ballY += ballSpeedY * 2;
-            }
-        }
-        
-        if (ballY <= 0) ballSpeedY = Math.abs(ballSpeedY);
-        if (ballY + BALL_SIZE >= height) ballSpeedY = -Math.abs(ballSpeedY);
-        // Appeler checkKingStatus à la fin
+    private void drawGame() {
         GraphicsContext gc = canvas.getGraphicsContext2D();
-        checkKingStatus(gc);
-    }
-
-    private void checkKingStatus(GraphicsContext gc) {
-        boolean whiteKingAlive = false;
-        boolean blackKingAlive = false;
+        gc.clearRect(0, 0, canvas.getWidth(), canvas.getHeight());
+        game.draw(gc);
         
-        for (int row = 0; row < 8; row++) {
-            for (int col = 0; col < boardWidth; col++) {
-                if (boardLife[row][col].containsKey("symbol")) {
-                    PieceInfo piece = boardLife[row][col].get("symbol");
-                    if (piece.symbol.equals("♔") || piece.symbol.equals("♚")) {
-                        if (piece.symbol.equals("♔") && piece.life > 0) whiteKingAlive = true;
-                        if (piece.symbol.equals("♚") && piece.life > 0) blackKingAlive = true;
-                    }
-                }
-            }
+        // Draw aiming arrow overlay when user is aiming
+        if (isAiming) {
+            gc.setStroke(Color.RED);
+            gc.setLineWidth(3);
+            double bx = game.getBall().getX() + game.getBall().getSize() / 2;
+            double by = game.getBall().getY() + game.getBall().getSize() / 2;
+            gc.strokeLine(bx, by, aimCurrentX, aimCurrentY);
+            // small arrow head
+            double angle = Math.atan2(aimCurrentY - by, aimCurrentX - bx);
+            double arrowSize = 10;
+            double ax1 = aimCurrentX - arrowSize * Math.cos(angle - Math.PI / 6);
+            double ay1 = aimCurrentY - arrowSize * Math.sin(angle - Math.PI / 6);
+            double ax2 = aimCurrentX - arrowSize * Math.cos(angle + Math.PI / 6);
+            double ay2 = aimCurrentY - arrowSize * Math.sin(angle + Math.PI / 6);
+            gc.strokeLine(aimCurrentX, aimCurrentY, ax1, ay1);
+            gc.strokeLine(aimCurrentX, aimCurrentY, ax2, ay2);
         }
+    }
+    
+    private void drawGameOver() {
+        GraphicsContext gc = canvas.getGraphicsContext2D();
+        gc.setFont(Font.font(48));
         
-        // Afficher le message de victoire
-        if (!whiteKingAlive) {
-            gc.setFont(Font.font(48));
+        if (!game.getBoard().isKingAlive(true)) {
             gc.setFill(Color.RED);
             gc.fillText("NOIR GAGNE!", canvas.getWidth()/2 - 120, canvas.getHeight()/2);
-            isGameRunning = false;
-            if (gameTimer != null) gameTimer.stop();
-        } else if (!blackKingAlive) {
-            gc.setFont(Font.font(48));
+        } else if (!game.getBoard().isKingAlive(false)) {
             gc.setFill(Color.BLUE);
             gc.fillText("BLANC GAGNE!", canvas.getWidth()/2 - 120, canvas.getHeight()/2);
-            isGameRunning = false;
-            if (gameTimer != null) gameTimer.stop();
         }
     }
-
-    // Configuration du reseau
-    private void startGameServer(int port) {
+    
+    // Méthodes réseau - rendre publique pour GameServer
+    public void startGameServer(int port) {
         networkExecutor.submit(() -> {
             try {
                 gameServer = new GameServer(port, this);
@@ -1063,8 +541,8 @@ public class ChessPingApp extends Application {
             }
         });
     }
-
-    private void connectToGameServer(String ip, int port) {
+    
+    public void connectToGameServer(String ip, int port) {
         networkExecutor.submit(() -> {
             try {
                 gameClient = new GameClient(ip, port, this);
@@ -1078,144 +556,342 @@ public class ChessPingApp extends Application {
             }
         });
     }
+    
+    // Rendre cette méthode publique pour GameServer
+    public GameState createGameState() {
+        GameState gs = new GameState();
+        
+        // Configuration
+        gs.pieceLevel = config.pieceLevel;
+        gs.kingLife = config.kingLife;
+        gs.queenLife = config.queenLife;
+        gs.knightLife = config.knightLife;
+        gs.pawnLife = config.pawnLife;
+        
+        // État du jeu
+        gs.whitePaddleX = game.getWhitePlayer().getPaddle().getX();
+        gs.whitePaddleY = game.getWhitePlayer().getPaddle().getY();
+        gs.blackPaddleX = game.getBlackPlayer().getPaddle().getX();
+        gs.blackPaddleY = game.getBlackPlayer().getPaddle().getY();
+        gs.ballX = game.getBall().getX();
+        gs.ballY = game.getBall().getY();
+        gs.ballSpeedX = game.getBall().getSpeedX();
+        gs.ballSpeedY = game.getBall().getSpeedY();
+        gs.gameRunning = game.isGameRunning();
+        
+        // Sérialiser le plateau et la vie des pièces pour que les clients puissent
+        // reproduire exactement l'état du plateau.
+        int height = 8;
+        int width = config.pieceLevel;
+        gs.boardPieces = new String[height][width];
+        gs.piecesLife = new GameState.PieceLifeInfo[height][width];
 
-    // Méthode pour recevoir les mises à jour du serveur (pour le client)
+        for (int r = 0; r < height; r++) {
+            for (int c = 0; c < width; c++) {
+                com.chessping.models.pieces.Piece p = game.getBoard().getPieceAt(r, c);
+                if (p != null) {
+                    gs.boardPieces[r][c] = p.getSymbol();
+                    gs.piecesLife[r][c] = new GameState.PieceLifeInfo(p.getSymbol(), p.getLife(), p.isWhite());
+                } else {
+                    gs.boardPieces[r][c] = null;
+                    gs.piecesLife[r][c] = null;
+                }
+            }
+        }
+
+        return gs;
+    }
+    
+    // Méthode pour recevoir les mises à jour du serveur
     public void receiveNetworkUpdate(GameState gameState) {
         Platform.runLater(() -> {
             if (!isHost) {
-                // Apply configuration sent by host (piece counts, lives)
-                applyNetworkConfiguration(gameState);
-                
-                // Apply board state (pieces and their lives)
-                applyBoardState(gameState);
-                
-                whitePaddleX = gameState.whitePaddleX;
-                whitePaddleY = gameState.whitePaddleY;
-                blackPaddleX = gameState.blackPaddleX;
-                blackPaddleY = gameState.blackPaddleY;
-                ballX = gameState.ballX;
-                ballY = gameState.ballY;
-                ballSpeedX = gameState.ballSpeedX;
-                ballSpeedY = gameState.ballSpeedY;
-                
-                // Synchroniser l'état d'exécution : démarrer/arrêter l'animation locale selon l'hôte
-                if (gameState.gameRunning) {
-                    if (gameTimer == null) {
-                        startGameAnimation();
-                    } else {
-                        isGameRunning = true;
-                        gameTimer.start();
-                    }
-                } else {
-                    isGameRunning = false;
-                    if (gameTimer != null) gameTimer.stop();
-                }
-
-                // Mettre à jour l'interface
-                if (playPauseButton != null) {
-                    playPauseButton.setSelected(isGameRunning);
-                    playPauseButton.setText(isGameRunning ? "Pause" : "Play");
-                }
+                applyNetworkGameState(gameState);
             }
         });
     }
     
-    // Apply board state received from host
-    private void applyBoardState(GameState gs) {
-        if (gs.boardPieces != null && gs.piecesLife != null) {
-            // Copy board pieces
-            for (int i = 0; i < Math.min(gs.boardPieces.length, board.length); i++) {
-                for (int j = 0; j < Math.min(gs.boardPieces[i].length, board[i].length); j++) {
-                    board[i][j] = gs.boardPieces[i][j];
-                }
+    private void applyNetworkGameState(GameState gameState) {
+        if (gameState == null) return;
+        
+        // Appliquer la configuration
+        config.pieceLevel = gameState.pieceLevel;
+        config.kingLife = gameState.kingLife;
+        config.queenLife = gameState.queenLife;
+        config.knightLife = gameState.knightLife;
+        config.pawnLife = gameState.pawnLife;
+        
+        // Appliquer l'état du jeu
+        game.getWhitePlayer().getPaddle().setPosition(gameState.whitePaddleX, gameState.whitePaddleY);
+        game.getBlackPlayer().getPaddle().setPosition(gameState.blackPaddleX, gameState.blackPaddleY);
+        game.getBall().setPosition(gameState.ballX, gameState.ballY);
+        game.getBall().setSpeed(gameState.ballSpeedX, gameState.ballSpeedY);
+        game.setGameRunning(gameState.gameRunning);
+
+        // If the server started the game and this client doesn't have the animation running, start it
+        if (gameState.gameRunning && gameTimer == null) {
+            startGameAnimation();
+        }
+        
+        // Mettre à jour l'interface
+        if (playPauseButton != null) {
+            playPauseButton.setSelected(gameState.gameRunning);
+            playPauseButton.setText(gameState.gameRunning ? "Pause" : "Play");
+        }
+        
+        // Redessiner
+            drawGame();
+
+        // Si l'état du plateau est présent, l'appliquer
+        if (gameState.boardPieces != null && gameState.piecesLife != null) {
+            // Si la taille du plateau a changé, recréer le jeu et redimensionner le canvas
+            double desiredWidth = gameState.pieceLevel * TILE_SIZE;
+            if (canvas.getWidth() != desiredWidth) {
+                config.pieceLevel = gameState.pieceLevel;
+                // recreate game with new config
+                game = new ChessPingGame(config, TILE_SIZE);
+                // resize canvas to match new board width
+                canvas.setWidth(desiredWidth);
             }
-            
-            // Copy piece life info
-            for (int i = 0; i < Math.min(gs.piecesLife.length, boardLife.length); i++) {
-                for (int j = 0; j < Math.min(gs.piecesLife[i].length, boardLife[i].length); j++) {
-                    boardLife[i][j].clear();
-                    if (gs.piecesLife[i][j] != null) {
-                        PieceInfo p = new PieceInfo(
-                            gs.piecesLife[i][j].symbol,
-                            gs.piecesLife[i][j].life,
-                            gs.piecesLife[i][j].isWhite
-                        );
-                        boardLife[i][j].put("symbol", p);
+
+            // Clear and place pieces according to incoming state
+            game.getBoard().clearBoard();
+            int height = Math.min(gameState.boardPieces.length, 8);
+            for (int r = 0; r < height; r++) {
+                int width = Math.min(gameState.boardPieces[r].length, config.pieceLevel);
+                for (int c = 0; c < width; c++) {
+                    GameState.PieceLifeInfo pli = gameState.piecesLife[r][c];
+                    if (pli != null && pli.symbol != null) {
+                        com.chessping.models.pieces.Piece piece = createPieceFromSymbol(pli.symbol, pli.isWhite, r, c, pli.life);
+                        if (piece != null) {
+                            game.getBoard().placePiece(piece);
+                        }
+                    } else {
+                        // ensure null
+                        com.chessping.models.pieces.Piece existing = game.getBoard().getPieceAt(r, c);
+                        if (existing != null) game.getBoard().removePiece(existing);
                     }
                 }
             }
+
+            drawGame();
+        }
+
+        // Afficher l'écran de fin de partie si le plateau indique qu'un roi est mort
+        try {
+            boolean whiteKingAlive = game.getBoard().isKingAlive(true);
+            boolean blackKingAlive = game.getBoard().isKingAlive(false);
+            if (!whiteKingAlive || !blackKingAlive) {
+                // S'assurer que la partie est en pause côté client et afficher le message
+                game.setGameRunning(false);
+                if (playPauseButton != null) {
+                    playPauseButton.setSelected(false);
+                    playPauseButton.setText("Play");
+                }
+                drawGameOver();
+            }
+        } catch (Exception ex) {
+            // defensive: don't let a drawing error crash the network update
+            System.err.println("Error while applying game-over display: " + ex.getMessage());
         }
     }
-
-    // When receiving a GameState from host, also ensure configuration is applied
-    private void applyNetworkConfiguration(GameState gs) {
-        // If piece level or life values differ, apply them and recreate board
-        boolean needRecreate = false;
-        if (gs.pieceLevel != config.pieceLevel) {
-            config.pieceLevel = gs.pieceLevel;
-            needRecreate = true;
-        }
-        if (gs.kingLife != config.kingLife || gs.queenLife != config.queenLife ||
-            gs.knightLife != config.knightLife || gs.pawnLife != config.pawnLife) {
-            config.kingLife = gs.kingLife;
-            config.queenLife = gs.queenLife;
-            config.knightLife = gs.knightLife;
-            config.pawnLife = gs.pawnLife;
-            needRecreate = true;
-        }
-
-        if (needRecreate) {
-            // Recreate board and redraw
-            recreateBoard();
-            drawBoard(canvas.getGraphicsContext2D());
-        }
-    }
-
-    // Méthode pour envoyer les mises à jour au serveur
-    private void sendGameUpdate() {
-        if (gameClient != null && isClientConnected) {
-            GameState gameState = new GameState();
-            gameState.whitePaddleX = whitePaddleX;
-            gameState.whitePaddleY = whitePaddleY;
-            gameState.blackPaddleX = blackPaddleX;
-            gameState.blackPaddleY = blackPaddleY;
-            gameState.ballX = ballX;
-            gameState.ballY = ballY;
-            gameState.ballSpeedX = ballSpeedX;
-            gameState.ballSpeedY = ballSpeedY;
-            gameState.gameRunning = isGameRunning;
-            
-            gameClient.sendGameState(gameState);
-        }
-    }
-
-    // Mettre à jour l'état du jeu pour le réseau
+    
     private void updateNetworkGameState() {
         if (config.networkConfig.getMode() == GameMode.LOCAL) return;
         
         if (isHost) {
-            // Le host envoie l'état complet aux clients
+            // Host envoie l'état complet
             if (gameServer != null) {
                 GameState gameState = createGameState();
                 gameServer.broadcastGameState(gameState);
             }
         } else if (isClientConnected) {
-            // Le client envoie seulement sa position de raquette
+            // Client envoie seulement sa position de raquette
+            sendPaddleUpdate();
+        }
+    }
+
+    private com.chessping.models.pieces.Piece createPieceFromSymbol(String symbol, boolean isWhite, int row, int col, int life) {
+        if (symbol == null || symbol.isEmpty()) return null;
+        char ch = symbol.charAt(0);
+        switch (ch) {
+            case '♔': case '♚':
+                return new com.chessping.models.pieces.King(isWhite, row, col, life);
+            case '♕': case '♛':
+                return new com.chessping.models.pieces.Queen(isWhite, row, col, life);
+            case '♖': case '♜':
+                return new com.chessping.models.pieces.Rook(isWhite, row, col, life);
+            case '♗': case '♝':
+                return new com.chessping.models.pieces.Bishop(isWhite, row, col, life);
+            case '♘': case '♞':
+                return new com.chessping.models.pieces.Knight(isWhite, row, col, life);
+            case '♙': case '♟':
+                return new com.chessping.models.pieces.Pawn(isWhite, row, col, life);
+            default:
+                return null;
+        }
+    }
+    
+    private void sendPaddleUpdate() {
+        if (gameClient != null) {
             PaddleUpdate update = new PaddleUpdate(
-                isWhitePlayer ? whitePaddleX : blackPaddleX,
-                isWhitePlayer ? whitePaddleY : blackPaddleY,
+                isWhitePlayer ? game.getWhitePlayer().getPaddle().getX() : 
+                              game.getBlackPlayer().getPaddle().getX(),
+                isWhitePlayer ? game.getWhitePlayer().getPaddle().getY() : 
+                              game.getBlackPlayer().getPaddle().getY(),
                 isWhitePlayer,
                 playerName
             );
             gameClient.sendPaddleUpdate(update);
         }
     }
+    
+    // Getters pour GameServer (remplacent les variables publiques)
+    public double getWhitePaddleX() {
+        return game.getWhitePlayer().getPaddle().getX();
+    }
+    
+    public double getWhitePaddleY() {
+        return game.getWhitePlayer().getPaddle().getY();
+    }
+    
+    public double getBlackPaddleX() {
+        return game.getBlackPlayer().getPaddle().getX();
+    }
+    
+    public double getBlackPaddleY() {
+        return game.getBlackPlayer().getPaddle().getY();
+    }
+    
+    public void setWhitePaddlePosition(double x, double y) {
+        game.getWhitePlayer().getPaddle().setPosition(x, y);
+    }
+    
+    public void setBlackPaddlePosition(double x, double y) {
+        game.getBlackPlayer().getPaddle().setPosition(x, y);
+    }
+    
+    private void setupStageCloseHandler(Stage stage) {
+        stage.setOnCloseRequest(ev -> {
+            if (gameTimer != null) gameTimer.stop();
+            if (gameServer != null) {
+                try { gameServer.stop(); } catch (Exception ignored) {}
+            }
+            if (gameClient != null) {
+                try { gameClient.disconnect(); } catch (Exception ignored) {}
+            }
+            networkExecutor.shutdownNow();
+        });
+    }
 
-    private void sendPaddleUpdate(double x, double y, boolean isWhite) {
-        if (gameClient != null) {
-            PaddleUpdate update = new PaddleUpdate(x, y, isWhite, playerName);
-            gameClient.sendPaddleUpdate(update);
+    // Position the ball just in front of the given player's paddle
+    private void positionBallForServe(boolean white) {
+        double paddleX = white ? game.getWhitePlayer().getPaddle().getX() : game.getBlackPlayer().getPaddle().getX();
+        double paddleY = white ? game.getWhitePlayer().getPaddle().getY() : game.getBlackPlayer().getPaddle().getY();
+        double paddleW = white ? game.getWhitePlayer().getPaddle().getWidth() : game.getBlackPlayer().getPaddle().getWidth();
+        double paddleH = white ? game.getWhitePlayer().getPaddle().getHeight() : game.getBlackPlayer().getPaddle().getHeight();
+        // Place ball in front of paddle (into play area, toward opponent)
+        // White paddle is at top (around y=170), so ball goes DOWN toward middle
+        // Black paddle is at bottom (around y=480), so ball goes UP toward middle
+        double bx = paddleX + paddleW / 2 - game.getBall().getSize() / 2;
+        double by = white ? (paddleY + paddleH + 5) : (paddleY - game.getBall().getSize() - 5);
+        game.getBall().setPosition(bx, by);
+        // ensure not running
+        game.setGameRunning(false);
+        awaitingServe = true;
+        drawGame();
+    }
+
+    // Launch the ball with velocity (vx,vy). This is authoritative when called on the host.
+    public void launchBall(double vx, double vy, boolean launchedByWhite) {
+        // set ball speed and start the game
+        game.getBall().setSpeed(vx, vy);
+        game.setGameRunning(true);
+        awaitingServe = false;
+        // ensure animation running
+        if (gameTimer == null) startGameAnimation();
+        // update play button state
+        if (playPauseButton != null) {
+            playPauseButton.setSelected(true);
+            playPauseButton.setText("Pause");
         }
+    }
+    
+    private VBox createLeftPanel() {
+        VBox vb = new VBox(15);
+        vb.setPadding(new Insets(20));
+        vb.setPrefWidth(300);
+        vb.setStyle("-fx-background-color: #eae3d94c;");
+        
+        // Configuration
+        VBox configInfo = new VBox(5);
+        configInfo.setStyle("-fx-background-color: #2c3e50; -fx-padding: 10; -fx-background-radius: 5;");
+        
+        String modeText = config.isNetworkMode() ? "Mode Réseau" : "Mode Local";
+        String lifeText = String.format("Roi:%d | Reine:%d | Cavalier:%d | Pion:%d",
+            config.kingLife, config.queenLife, config.knightLife, config.pawnLife);
+        
+        configInfo.getChildren().addAll(
+            createInfoText("Configuration actuelle:"),
+            createInfoText("Pièces: " + config.pieceLevel),
+            createInfoText(modeText),
+            createInfoText("Vies: " + lifeText),
+            createInfoText("Contrôles:"),
+            createInfoText("Haut: ZQSD"),
+            createInfoText("Bas: Flèches")
+        );
+        
+        // Boutons
+        VBox controlButtons = createControlButtons();
+        
+        // Reconfigurer
+        Button reconfigBtn = new Button("Reconfigurer");
+        reconfigBtn.setPrefWidth(150);
+        reconfigBtn.setOnAction(e -> showConfigurationWindow((Stage)canvas.getScene().getWindow()));
+        
+        vb.getChildren().addAll(configInfo, controlButtons, reconfigBtn);
+        return vb;
+    }
+    
+    private VBox createControlButtons() {
+        VBox buttonBox = new VBox(10);
+        
+        playPauseButton = new ToggleButton("Play");
+        playPauseButton.setPrefWidth(150);
+        playPauseButton.setStyle("-fx-background-color: #4CAF50; -fx-text-fill: white;");
+        
+        playPauseButton.setOnAction(e -> {
+            if (playPauseButton.isSelected()) {
+                // Enter awaiting-serve state: the game will actually start when a player launches the ball
+                playPauseButton.setText("Pause");
+                playPauseButton.setStyle("-fx-background-color: #ff9800; -fx-text-fill: white;");
+                awaitingServe = true;
+                game.setGameRunning(false);
+                startGameAnimation();
+                // place ball in front of the local player so they can serve
+                positionBallForServe(isWhitePlayer);
+                canvas.requestFocus();
+            } else {
+                playPauseButton.setText("Play");
+                playPauseButton.setStyle("-fx-background-color: #4CAF50; -fx-text-fill: white;");
+                awaitingServe = false;
+                game.setGameRunning(false);
+                if (gameTimer != null) gameTimer.stop();
+            }
+        });
+        
+        Button restart = new Button("Restart");
+        restart.setPrefWidth(150);
+        restart.setOnAction(e -> {
+            game.setGameRunning(false);
+            game.restart();
+            playPauseButton.setSelected(false);
+            playPauseButton.setText("Play");
+            drawGame();
+        });
+        
+        buttonBox.getChildren().addAll(playPauseButton, restart);
+        return buttonBox;
     }
     
     private javafx.scene.text.Text createInfoText(String s) {
@@ -1225,10 +901,12 @@ public class ChessPingApp extends Application {
         return t;
     }
     
-    private javafx.scene.text.Text javafxText(String s) {
-        javafx.scene.text.Text t = new javafx.scene.text.Text(s);
-        t.setFill(Color.BLACK);
-        return t;
+    private void showAlert(String title, String header, String content) {
+        Alert alert = new Alert(Alert.AlertType.ERROR);
+        alert.setTitle(title);
+        alert.setHeaderText(header);
+        alert.setContentText(content);
+        alert.showAndWait();
     }
     
     public static void main(String[] args) {
