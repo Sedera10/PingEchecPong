@@ -21,18 +21,18 @@ public class ChessBoard {
         this.pieces = new ArrayList<>();
     }
     
-    public void initialize(int pieceLevel, int kingLife, int queenLife, int knightLife, int pawnLife) {
+    public void initialize(int pieceLevel, int kingLife, int queenLife, int knightLife, int pawnLife, int bishopLife, int rookLife) {
         clearBoard();
         pieces.clear();
         
         if (pieceLevel == 2) {
             initialize2Pieces(kingLife, queenLife, pawnLife);
         } else if (pieceLevel == 4) {
-            initialize4Pieces(kingLife, queenLife, pawnLife);
+            initialize4Pieces(kingLife, queenLife, bishopLife, pawnLife);
         } else if (pieceLevel == 6) {
-            initialize6Pieces(kingLife, queenLife, knightLife, pawnLife);
+            initialize6Pieces(kingLife, queenLife, knightLife, bishopLife, pawnLife);
         } else if (pieceLevel == 8) {
-            initialize8Pieces(kingLife, queenLife, knightLife, pawnLife);
+            initialize8Pieces(kingLife, queenLife, knightLife, bishopLife, rookLife, pawnLife);
         }
     }
     
@@ -50,69 +50,69 @@ public class ChessBoard {
         addPiece(new Pawn(false, 6, 1, pawnLife));
     }
     
-    private void initialize4Pieces(int kingLife, int queenLife, int pawnLife) {
+    private void initialize4Pieces(int kingLife, int queenLife, int bishopLife, int pawnLife) {
         for (int i = 0; i < 4; i++) {
             addPiece(new Pawn(true, 1, i, pawnLife));
             addPiece(new Pawn(false, 6, i, pawnLife));
         }
         
-        addPiece(new Bishop(true, 0, 0, 3));
+        addPiece(new Bishop(true, 0, 0, bishopLife));
         addPiece(new Queen(true, 0, 1, queenLife));
         addPiece(new King(true, 0, 2, kingLife));
-        addPiece(new Bishop(true, 0, 3, 3));
+        addPiece(new Bishop(true, 0, 3, bishopLife));
         
-        addPiece(new Bishop(false, 7, 0, 3));
+        addPiece(new Bishop(false, 7, 0, bishopLife));
         addPiece(new Queen(false, 7, 1, queenLife));
         addPiece(new King(false, 7, 2, kingLife));
-        addPiece(new Bishop(false, 7, 3, 3));
+        addPiece(new Bishop(false, 7, 3, bishopLife));
     }
     
-    private void initialize6Pieces(int kingLife, int queenLife, int knightLife, int pawnLife) {
+    private void initialize6Pieces(int kingLife, int queenLife, int knightLife, int bishopLife, int pawnLife) {
         for (int i = 0; i < 6; i++) {
             addPiece(new Pawn(true, 1, i, pawnLife));
             addPiece(new Pawn(false, 6, i, pawnLife));
         }
         
         addPiece(new Knight(true, 0, 0, knightLife));
-        addPiece(new Bishop(true, 0, 1, 3));
+        addPiece(new Bishop(true, 0, 1, bishopLife));
         addPiece(new Queen(true, 0, 2, queenLife));
         addPiece(new King(true, 0, 3, kingLife));
-        addPiece(new Bishop(true, 0, 4, 3));
+        addPiece(new Bishop(true, 0, 4, bishopLife));
         addPiece(new Knight(true, 0, 5, knightLife));
         
         addPiece(new Knight(false, 7, 0, knightLife));
-        addPiece(new Bishop(false, 7, 1, 3));
+        addPiece(new Bishop(false, 7, 1, bishopLife));
         addPiece(new Queen(false, 7, 2, queenLife));
         addPiece(new King(false, 7, 3, kingLife));
-        addPiece(new Bishop(false, 7, 4, 3));
+        addPiece(new Bishop(false, 7, 4, bishopLife));
         addPiece(new Knight(false, 7, 5, knightLife));
     }
     
-    private void initialize8Pieces(int kingLife, int queenLife, int knightLife, int pawnLife) {
+    private void initialize8Pieces(int kingLife, int queenLife, int knightLife, int bishopLife, int rookLife, int pawnLife) {
         for (int i = 0; i < 8; i++) {
             addPiece(new Pawn(true, 1, i, pawnLife));
             addPiece(new Pawn(false, 6, i, pawnLife));
         }
         
         // Pièces blanches
-        addPiece(new Rook(true, 0, 0, 3));
+        addPiece(new Rook(true, 0, 0, rookLife));
         addPiece(new Knight(true, 0, 1, knightLife));
-        addPiece(new Bishop(true, 0, 2, 3));
+        addPiece(new Bishop(true, 0, 2, bishopLife));
         addPiece(new Queen(true, 0, 3, queenLife));
         addPiece(new King(true, 0, 4, kingLife));
-        addPiece(new Bishop(true, 0, 5, 3));
+        addPiece(new Bishop(true, 0, 5, bishopLife));
         addPiece(new Knight(true, 0, 6, knightLife));
-        addPiece(new Rook(true, 0, 7, 3));
+        addPiece(new Rook(true, 0, 7, rookLife));
         
         // Pièces noires
-        addPiece(new Rook(false, 7, 0, 3));
+        addPiece(new Rook(false, 7, 0, rookLife));
         addPiece(new Knight(false, 7, 1, knightLife));
-        addPiece(new Bishop(false, 7, 2, 3));
+        addPiece(new Bishop(false, 7, 2, bishopLife));
         addPiece(new Queen(false, 7, 3, queenLife));
         addPiece(new King(false, 7, 4, kingLife));
-        addPiece(new Bishop(false, 7, 5, 3));
+        addPiece(new Bishop(false, 7, 5, bishopLife));
         addPiece(new Knight(false, 7, 6, knightLife));
-        addPiece(new Rook(false, 7, 7, 3));
+        addPiece(new Rook(false, 7, 7, rookLife));
     }
     
     private void addPiece(Piece piece) {

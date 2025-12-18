@@ -16,6 +16,8 @@ public class GameState implements Serializable {
     public int queenLife = 4;
     public int knightLife = 2;
     public int pawnLife = 1;
+    public int bishopLife = 3;
+    public int rookLife = 4;
     public String[][] boardPieces;
     public PieceLifeInfo[][] piecesLife;
     

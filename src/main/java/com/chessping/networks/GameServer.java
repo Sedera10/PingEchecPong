@@ -83,18 +83,34 @@ public class GameServer {
         public void run() {
             try {
                 out = new ObjectOutputStream(socket.getOutputStream());
+                out.flush();  // IMPORTANT: flush pour éviter le deadlock avec ObjectInputStream
                 in = new ObjectInputStream(socket.getInputStream());
                 
                 System.out.println("ClientHandler démarré pour " + socket.getInetAddress());
 
-                // Send initial game state to this client so it can sync configuration
+                // Attendre un peu pour que le CLIENT initialise son ObjectInputStream
                 try {
-                    if (app != null) {
+                    Thread.sleep(100);  // 100ms devrait suffire
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+
+                // Envoyer l'état initial au client pour synchroniser la configuration
+                if (app != null) {
+                    try {
                         GameState initial = app.createGameState();
+                        System.out.println("=== Envoi état initial au nouveau client ===");
+                        System.out.println("  pieceLevel: " + initial.pieceLevel);
+                        System.out.println("  kingLife: " + initial.kingLife);
+                        System.out.println("  queenLife: " + initial.queenLife);
+                        System.out.println("  knightLife: " + initial.knightLife);
+                        System.out.println("  pawnLife: " + initial.pawnLife);
                         sendGameState(initial);
+                        System.out.println("État initial envoyé avec succès");
+                    } catch (Exception ex) {
+                        System.err.println("ERREUR CRITIQUE envoi état initial: " + ex.getMessage());
+                        ex.printStackTrace();
                     }
-                } catch (Exception ex) {
-                    System.out.println("Erreur envoi état initial: " + ex.getMessage());
                 }
 
                 // Recevoir les messages
@@ -112,6 +128,19 @@ public class GameServer {
                                 } else {
                                     app.setBlackPaddlePosition(update.x, update.y);
                                 }
+                            });
+                        }
+                    } else if (obj instanceof ServeRequest) {
+                        ServeRequest req = (ServeRequest) obj;
+                        System.out.println("Reçu ServeRequest de " + req.playerName);
+                        
+                        // Le client veut servir la balle
+                        if (app != null) {
+                            Platform.runLater(() -> {
+                                app.launchBall(req.vx, req.vy, req.isWhite);
+                                // Broadcast immédiatement pour synchroniser tous les clients
+                                GameState gs = app.createGameState();
+                                server.broadcastGameState(gs);
                             });
                         }
                     }

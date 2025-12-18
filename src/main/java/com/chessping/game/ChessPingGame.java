@@ -17,7 +17,7 @@ public class ChessPingGame {
     public ChessPingGame(GameConfig config, int tileSize) {
         this.config = config;
         this.board = new ChessBoard(config.pieceLevel, 8, tileSize);
-        this.ball = new Ball(200, 300, 20, 20, 20, Color.YELLOW);
+        this.ball = new Ball(200, 300, 25, 25, 20, Color.YELLOW);
         this.isGameRunning = false;
         
         // Initialiser les joueurs avec leurs raquettes
@@ -53,7 +53,9 @@ public class ChessPingGame {
             config.kingLife,
             config.queenLife,
             config.knightLife,
-            config.pawnLife
+            config.pawnLife,
+            config.bishopLife,
+            config.rookLife
         );
         ball.resetPosition(config.pieceLevel * 85, 8 * 85);
         ball.setSpeed(3, 3);
@@ -64,34 +66,38 @@ public class ChessPingGame {
         
         ball.update();
         
-        // Vérifier les collisions avec les bords
         ball.checkBoundaries(config.pieceLevel * 85, 8 * 85);
         
-        // Vérifier les collisions avec les raquettes
         checkPaddleCollisions();
         
-        // Vérifier les collisions avec les pièces
         checkPieceCollisions();
     }
     
     private void checkPaddleCollisions() {
-        // Méthode utilitaire pour vérifier la collision balle/raquette
-        if (ballCollidesWith(
-            whitePlayer.getPaddle().getX(),
-            whitePlayer.getPaddle().getY(),
-            whitePlayer.getPaddle().getWidth(),
-            whitePlayer.getPaddle().getHeight()
+        // Raquette blanche (en haut) - la balle vient du terrain (en bas) et MONTE (speedY < 0)
+        Paddle whitePaddle = whitePlayer.getPaddle();
+        if (ball.getSpeedY() < 0 && ballCollidesWith(
+            whitePaddle.getX(),
+            whitePaddle.getY(),
+            whitePaddle.getWidth(),
+            whitePaddle.getHeight()
         )) {
             ball.bounceY();
+            // Repositionner la balle EN-DESSOUS de la raquette pour éviter qu'elle reste collée
+            ball.setPosition(ball.getX(), whitePaddle.getY() + whitePaddle.getHeight() + 1);
         }
         
-        if (ballCollidesWith(
-            blackPlayer.getPaddle().getX(),
-            blackPlayer.getPaddle().getY(),
-            blackPlayer.getPaddle().getWidth(),
-            blackPlayer.getPaddle().getHeight()
+        // Raquette noire (en bas) - la balle vient du terrain (en haut) et DESCEND (speedY > 0)
+        Paddle blackPaddle = blackPlayer.getPaddle();
+        if (ball.getSpeedY() > 0 && ballCollidesWith(
+            blackPaddle.getX(),
+            blackPaddle.getY(),
+            blackPaddle.getWidth(),
+            blackPaddle.getHeight()
         )) {
             ball.bounceY();
+            // Repositionner la balle AU-DESSUS de la raquette pour éviter qu'elle reste collée
+            ball.setPosition(ball.getX(), blackPaddle.getY() - ball.getSize() - 1);
         }
     }
     

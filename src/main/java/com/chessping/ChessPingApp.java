@@ -17,6 +17,9 @@ import javafx.scene.input.KeyEvent;
 import com.chessping.networks.*;
 import com.chessping.game.ChessPingGame;
 import com.chessping.game.Ball;
+import com.chessping.ejb.EjbConf;
+import com.chessping.ejb.GameConfigAdapter;
+import com.chessping.ejb.backend.service.GameConfigRemote;
 import java.net.*;
 import java.io.*;
 import java.util.HashSet;
@@ -26,6 +29,7 @@ import javafx.application.Platform;
 import com.chessping.networks.*;
 import com.chessping.models.pieces.*;
 import com.chessping.models.*;
+
 
 public class ChessPingApp extends Application {
     
@@ -45,13 +49,32 @@ public class ChessPingApp extends Application {
     private boolean isClientConnected = false;
     private String playerName;
     private boolean isWhitePlayer = true;
+    private boolean gameRecreated = false;  // Flag pour éviter de recréer le jeu plusieurs fois
     // pour la service de balle
     private boolean awaitingServe = false;
     private boolean isAiming = false;
     private double aimStartX, aimStartY, aimCurrentX, aimCurrentY;
+    // game over state
+    private boolean gameOverDisplayed = false;
+    private String gameOverMessage = "";
     
     private ExecutorService networkExecutor = Executors.newCachedThreadPool();
     private ChessPingGame game;
+
+    // Service EJB via WildFly
+    private GameConfigAdapter configAdapter;
+    
+    public ChessPingApp() {
+        try {
+            GameConfigRemote ejbRemote = EjbConf.lookup();
+            this.configAdapter = new GameConfigAdapter(ejbRemote);
+            System.out.println("✓ Connexion EJB WildFly réussie");
+        } catch (Exception e) {
+            System.err.println("✗ Impossible de se connecter à l'EJB WildFly");
+            e.printStackTrace();
+        }
+    }
+
     
     @Override
     public void start(Stage primaryStage) {
@@ -222,17 +245,23 @@ public class ChessPingApp extends Application {
         Spinner<Integer> queenSpinner = new Spinner<>(1, 10, 4);
         Spinner<Integer> knightSpinner = new Spinner<>(1, 10, 2);
         Spinner<Integer> pawnSpinner = new Spinner<>(1, 10, 1);
+        Spinner<Integer> bishopSpinner = new Spinner<>(1, 10, 3);
+        Spinner<Integer> rookSpinner = new Spinner<>(1, 10, 4);
         
         kingSpinner.setEditable(true);
         queenSpinner.setEditable(true);
         knightSpinner.setEditable(true);
         pawnSpinner.setEditable(true);
+        bishopSpinner.setEditable(true);
+        rookSpinner.setEditable(true);
         
         VBox lifeBox = new VBox(5,
             new HBox(10, new Label("Roi:"), kingSpinner),
             new HBox(10, new Label("Reine:"), queenSpinner),
             new HBox(10, new Label("Cavalier:"), knightSpinner),
-            new HBox(10, new Label("Pion:"), pawnSpinner)
+            new HBox(10, new Label("Pion:"), pawnSpinner),
+            new HBox(10, new Label("Fou:"), bishopSpinner),
+            new HBox(10, new Label("Tour:"), rookSpinner)
         );
         
         grid.add(lifeLabel, 0, row);
@@ -327,6 +356,16 @@ public class ChessPingApp extends Application {
                 config.queenLife = queenSpinner.getValue();
                 config.knightLife = knightSpinner.getValue();
                 config.pawnLife = pawnSpinner.getValue();
+                config.bishopLife = bishopSpinner.getValue();
+                config.rookLife = rookSpinner.getValue();
+            }
+            
+            // APRÈS avoir lu tous les spinners, sauvegarder en BD via EJB
+            try {
+                configAdapter.saveConfig(config, "defaultConfig");
+            } catch (Exception ex) {
+                System.out.println("Erreur sauvegarde config: " + ex.getMessage());
+                ex.printStackTrace();
             }
             
             config.networkConfig = networkConfig;
@@ -362,6 +401,27 @@ public class ChessPingApp extends Application {
             game.setBlackPlayerName("Joueur 2");
         }
         
+        // NE PAS recharger la config en mode JOIN - le serveur va l'envoyer!
+        // En mode HOST/LOCAL, on peut recharger depuis la BD si nécessaire
+        if (config.networkConfig.getMode() != GameMode.JOIN) {
+            // IMPORTANT: Sauvegarder networkConfig avant de recharger depuis la BD
+            NetworkConfig savedNetworkConfig = config.networkConfig;
+            
+            try {
+                config = configAdapter.loadConfig("defaultConfig");
+                System.out.println("✓ Config rechargée depuis BD (pieceLevel=" + config.pieceLevel + ")");
+            } catch (Exception ex) {
+                System.out.println("Config par défaut utilisée");
+                config = new GameConfig();
+            }
+            
+            // RESTAURER la networkConfig après rechargement (sinon le mode réseau est perdu!)
+            config.networkConfig = savedNetworkConfig;
+            System.out.println("✓ NetworkConfig restauré: mode=" + config.networkConfig.getMode());
+        } else {
+            System.out.println("✓ Mode JOIN: config sera reçue du serveur, pas de rechargement depuis BD");
+        }
+        
         // Configuration de l'interface
         canvas = new Canvas(config.pieceLevel * TILE_SIZE, 8 * TILE_SIZE);
         
@@ -380,6 +440,13 @@ public class ChessPingApp extends Application {
         setupStageCloseHandler(stage);
         
         drawGame();
+        
+        // En mode réseau, démarrer l'AnimationTimer immédiatement pour la synchronisation
+        // Le client doit pouvoir recevoir et afficher l'état du serveur dès la connexion
+        if (config.isNetworkMode()) {
+            System.out.println("Démarrage de l'AnimationTimer pour synchronisation réseau...");
+            startGameAnimation();
+        }
     }
     
     private void setupKeyControls(Scene scene) {
@@ -448,6 +515,96 @@ public class ChessPingApp extends Application {
         }
     }
     
+    // Mouvement continu des raquettes basé sur les touches actuellement pressées
+    private void handleContinuousMovement() {
+        double speed = 0.08 * TILE_SIZE;
+        boolean moved = false;
+        
+        if (config.networkConfig.getMode() == GameMode.LOCAL) {
+            // Mode LOCAL UNIQUEMENT : contrôler les deux raquettes
+            // Joueur blanc (touches WASD/ZQSD)
+            if (pressedKeys.contains(KeyCode.A) || pressedKeys.contains(KeyCode.Q)) {
+                game.moveWhitePaddle(-speed, 0);
+                moved = true;
+            }
+            if (pressedKeys.contains(KeyCode.D)) {
+                game.moveWhitePaddle(speed, 0);
+                moved = true;
+            }
+            if (pressedKeys.contains(KeyCode.W) || pressedKeys.contains(KeyCode.Z)) {
+                game.moveWhitePaddle(0, -speed);
+                moved = true;
+            }
+            if (pressedKeys.contains(KeyCode.S)) {
+                game.moveWhitePaddle(0, speed);
+                moved = true;
+            }
+            
+            // Joueur noir (touches fléchées)
+            if (pressedKeys.contains(KeyCode.LEFT)) {
+                game.moveBlackPaddle(-speed, 0);
+                moved = true;
+            }
+            if (pressedKeys.contains(KeyCode.RIGHT)) {
+                game.moveBlackPaddle(speed, 0);
+                moved = true;
+            }
+            if (pressedKeys.contains(KeyCode.UP)) {
+                game.moveBlackPaddle(0, -speed);
+                moved = true;
+            }
+            if (pressedKeys.contains(KeyCode.DOWN)) {
+                game.moveBlackPaddle(0, speed);
+                moved = true;
+            }
+        } else if (isHost || isClientConnected) {
+            // Mode CLIENT : contrôler SEULEMENT sa propre raquette
+            // Le reste de l'état (balle, autre raquette, pièces) vient du serveur via applyNetworkGameState()
+            if (isWhitePlayer) {
+                // Client joue blanc : contrôler uniquement raquette blanche
+                if (pressedKeys.contains(KeyCode.A) || pressedKeys.contains(KeyCode.Q)) {
+                    game.moveWhitePaddle(-speed, 0);
+                    moved = true;
+                }
+                if (pressedKeys.contains(KeyCode.D)) {
+                    game.moveWhitePaddle(speed, 0);
+                    moved = true;
+                }
+                if (pressedKeys.contains(KeyCode.W) || pressedKeys.contains(KeyCode.Z)) {
+                    game.moveWhitePaddle(0, -speed);
+                    moved = true;
+                }
+                if (pressedKeys.contains(KeyCode.S)) {
+                    game.moveWhitePaddle(0, speed);
+                    moved = true;
+                }
+            } else {
+                // Client joue noir : contrôler uniquement raquette noire
+                if (pressedKeys.contains(KeyCode.LEFT)) {
+                    game.moveBlackPaddle(-speed, 0);
+                    moved = true;
+                }
+                if (pressedKeys.contains(KeyCode.RIGHT)) {
+                    game.moveBlackPaddle(speed, 0);
+                    moved = true;
+                }
+                if (pressedKeys.contains(KeyCode.UP)) {
+                    game.moveBlackPaddle(0, -speed);
+                    moved = true;
+                }
+                if (pressedKeys.contains(KeyCode.DOWN)) {
+                    game.moveBlackPaddle(0, speed);
+                    moved = true;
+                }
+            }
+        }
+        
+        // Client envoie sa position de raquette au serveur
+        if (moved && config.isNetworkMode() && !isHost && isClientConnected) {
+            sendPaddleUpdate();
+        }
+    }
+    
     private void startGameAnimation() {
         gameTimer = new AnimationTimer() {
             long last = 0;
@@ -455,32 +612,42 @@ public class ChessPingApp extends Application {
             
             @Override
             public void handle(long now) {
-                // Allow animation to run either while game is running or while awaiting a serve
-                if (!game.isGameRunning() && !awaitingServe) return;
+                // Allow animation to run:
+                // - En mode réseau: toujours (pour synchronisation HOST/CLIENT)
+                // - En mode local: seulement si le jeu tourne ou en attente de service
+                if (!config.isNetworkMode() && !game.isGameRunning() && !awaitingServe) return;
 
-                if (now - last < 16_000_000) return;
+                if (now - last < 12_000_000) return;
                 last = now;
 
-                if (game.isGameRunning()) {
-                    // Mettre à jour le jeu
-                    game.update();
+                // Traiter les touches pressées pour mouvement continu
+                handleContinuousMovement();
 
-                    // Vérifier fin de partie
-                    if (game.checkGameOver()) {
-                        game.setGameRunning(false);
-                        awaitingServe = false;
-                        playPauseButton.setSelected(false);
-                        playPauseButton.setText("Play");
-                        drawGameOver();
+                if (game.isGameRunning()) {
+                    // Mettre à jour le jeu SEULEMENT si on est le host ou en mode local
+                    // Le client reçoit l'état du serveur via le réseau
+                    if (config.networkConfig.getMode() == GameMode.LOCAL || isHost) {
+                        game.update();
+
+                        // Vérifier fin de partie
+                        if (game.checkGameOver()) {
+                            game.setGameRunning(false);
+                            awaitingServe = false;
+                            playPauseButton.setSelected(false);
+                            playPauseButton.setText("Play");
+                            drawGameOver();
+                        }
                     }
+                    // Si on est client, game.update() n'est PAS appelé
+                    // On reçoit l'état via updateNetworkGameState() à 60 FPS
                 }
 
                 // Dessiner (also when awaiting serve so aim overlay appears)
                 drawGame();
 
-                // Synchronisation réseau
+                // Synchronisation réseau (plus rapide pour fluidité)
                 if (config.isNetworkMode()) {
-                    if (now - lastNetworkUpdate > 50_000_000) {
+                    if (now - lastNetworkUpdate > 16_666_667) {  // ~60 FPS (16.67ms)
                         updateNetworkGameState();
                         lastNetworkUpdate = now;
                     }
@@ -512,19 +679,162 @@ public class ChessPingApp extends Application {
             gc.strokeLine(aimCurrentX, aimCurrentY, ax1, ay1);
             gc.strokeLine(aimCurrentX, aimCurrentY, ax2, ay2);
         }
+        
+        // Draw game-over overlay if the game is over
+        if (gameOverDisplayed) {
+            drawGameOverOverlay(gc);
+        }
+    }
+    
+    private void drawGameOverOverlay(GraphicsContext gc) {
+        // Draw semi-transparent dark overlay
+        gc.setFill(Color.color(0, 0, 0, 0.7));
+        gc.fillRect(0, 0, canvas.getWidth(), canvas.getHeight());
+        
+        // Draw victory/defeat message box
+        double boxWidth = 200;
+        double boxHeight = 100;
+        double boxX = (canvas.getWidth() - boxWidth) / 2;
+        double boxY = (canvas.getHeight() - boxHeight) / 2;
+        
+        // Background box
+        gc.setFill(Color.color(0.1, 0.1, 0.15, 0.95));
+        gc.fillRoundRect(boxX, boxY, boxWidth, boxHeight, 20, 20);
+        
+        // Border
+        gc.setStroke(Color.GOLD);
+        gc.setLineWidth(3);
+        gc.strokeRoundRect(boxX, boxY, boxWidth, boxHeight, 20, 20);
+        
+        // Victory icon (star or crown emoji equivalent using shapes)
+        double starX = canvas.getWidth() / 2;
+        double starY = boxY + 40;
+        drawVictoryStar(gc, starX, starY, 25);
+        
+        // Title and message
+        gc.setFont(Font.font("Arial", javafx.scene.text.FontWeight.BOLD, 20));
+        gc.setFill(Color.GOLD);
+        
+        // Determine if win or loss for styling
+        boolean isWin = gameOverMessage.contains("gagné") && !gameOverMessage.contains("perdu");
+        if (isWin) {
+            gc.setFill(Color.LIGHTGREEN);
+        } else {
+            gc.setFill(Color.LIGHTCORAL);
+        }
+        
+        // Draw message
+        gc.setFont(Font.font("Arial", javafx.scene.text.FontWeight.BOLD, 15));
+        gc.fillText(gameOverMessage, boxX + 50, boxY + 90);
+        
+        // Draw buttons (Restart and Quit)
+        double buttonY = boxY + 140;
+        double buttonWidth = 110;
+        double buttonHeight = 30;
+        double spacing = 15;
+        double leftButtonX = boxX + (boxWidth - 2 * buttonWidth - spacing) / 2;
+        double rightButtonX = leftButtonX + buttonWidth + spacing;
+        
+        // Restart button
+        gc.setFill(Color.color(0.2, 0.7, 0.2, 0.9));
+        gc.fillRoundRect(leftButtonX, buttonY, buttonWidth, buttonHeight, 10, 10);
+        gc.setStroke(Color.WHITE);
+        gc.setLineWidth(2);
+        gc.strokeRoundRect(leftButtonX, buttonY, buttonWidth, buttonHeight, 10, 10);
+        gc.setFont(Font.font("Arial", javafx.scene.text.FontWeight.BOLD, 16));
+        gc.setFill(Color.WHITE);
+        gc.fillText("Restart", leftButtonX + 30, buttonY + 20);
+        
+        // Quit button
+        gc.setFill(Color.color(0.7, 0.2, 0.2, 0.9));
+        gc.fillRoundRect(rightButtonX, buttonY, buttonWidth, buttonHeight, 10, 10);
+        gc.setStroke(Color.WHITE);
+        gc.setLineWidth(2);
+        gc.strokeRoundRect(rightButtonX, buttonY, buttonWidth, buttonHeight, 10, 10);
+        gc.setFont(Font.font("Arial", javafx.scene.text.FontWeight.BOLD, 16));
+        gc.setFill(Color.WHITE);
+        gc.fillText("Quit", rightButtonX + 42, buttonY + 20);
+    }
+    
+    private void drawVictoryStar(GraphicsContext gc, double centerX, double centerY, double size) {
+        // Draw a simple 5-pointed star
+        double[] xPoints = new double[10];
+        double[] yPoints = new double[10];
+        
+        for (int i = 0; i < 10; i++) {
+            double angle = Math.PI / 2 + (i * Math.PI / 5);
+            double radius = (i % 2 == 0) ? size : size * 0.4;
+            xPoints[i] = centerX + radius * Math.cos(angle);
+            yPoints[i] = centerY - radius * Math.sin(angle);
+        }
+        
+        gc.setFill(Color.GOLD);
+        gc.fillPolygon(xPoints, yPoints, 10);
     }
     
     private void drawGameOver() {
-        GraphicsContext gc = canvas.getGraphicsContext2D();
-        gc.setFont(Font.font(48));
+        // Determine winner and set message
+        boolean whiteKingAlive = game.getBoard().isKingAlive(true);
+        boolean blackKingAlive = game.getBoard().isKingAlive(false);
         
-        if (!game.getBoard().isKingAlive(true)) {
-            gc.setFill(Color.RED);
-            gc.fillText("NOIR GAGNE!", canvas.getWidth()/2 - 120, canvas.getHeight()/2);
-        } else if (!game.getBoard().isKingAlive(false)) {
-            gc.setFill(Color.BLUE);
-            gc.fillText("BLANC GAGNE!", canvas.getWidth()/2 - 120, canvas.getHeight()/2);
+        if (!whiteKingAlive && blackKingAlive) {
+            // Black wins
+            if (config.isNetworkMode()) {
+                gameOverMessage = isHost ? "Vous avez perdu" : "Vous avez gagné";
+            } else {
+                gameOverMessage = "Le joueur 2 gagne!";
+            }
+        } else if (whiteKingAlive && !blackKingAlive) {
+            // White wins
+            if (config.isNetworkMode()) {
+                gameOverMessage = isHost ? "Vous avez gagné" : "Vous avez perdu";
+            } else {
+                gameOverMessage = "Le joueur 1 gagne!";
+            }
         }
+        
+        gameOverDisplayed = true;
+        setupGameOverMouseHandler();
+    }
+    
+    private void setupGameOverMouseHandler() {
+        canvas.setOnMouseClicked(e -> {
+            if (!gameOverDisplayed) return;
+            
+            double mouseX = e.getX();
+            double mouseY = e.getY();
+            
+            double boxWidth = 500;
+            double boxHeight = 300;
+            double boxX = (canvas.getWidth() - boxWidth) / 2;
+            double boxY = (canvas.getHeight() - boxHeight) / 2;
+            
+            double buttonY = boxY + 180;
+            double buttonWidth = 150;
+            double buttonHeight = 50;
+            double spacing = 30;
+            double leftButtonX = boxX + (boxWidth - 2 * buttonWidth - spacing) / 2;
+            double rightButtonX = leftButtonX + buttonWidth + spacing;
+            
+            // Check if Restart button clicked
+            if (mouseX >= leftButtonX && mouseX <= leftButtonX + buttonWidth &&
+                mouseY >= buttonY && mouseY <= buttonY + buttonHeight) {
+                gameOverDisplayed = false;
+                game.setGameRunning(false);
+                game.restart();
+                playPauseButton.setSelected(false);
+                playPauseButton.setText("Play");
+                awaitingServe = false;
+                drawGame();
+            }
+            
+            // Check if Quit button clicked
+            if (mouseX >= rightButtonX && mouseX <= rightButtonX + buttonWidth &&
+                mouseY >= buttonY && mouseY <= buttonY + buttonHeight) {
+                Stage stage = (Stage) canvas.getScene().getWindow();
+                stage.close();
+            }
+        });
     }
     
     // Méthodes réseau - rendre publique pour GameServer
@@ -543,13 +853,17 @@ public class ChessPingApp extends Application {
     }
     
     public void connectToGameServer(String ip, int port) {
+        System.out.println("[CLIENT] Tentative de connexion à " + ip + ":" + port);
         networkExecutor.submit(() -> {
             try {
                 gameClient = new GameClient(ip, port, this);
                 gameClient.connect();
                 isClientConnected = true;
-                System.out.println("Connecté au serveur " + ip + ":" + port);
+                System.out.println("[CLIENT] ✓ Connecté au serveur " + ip + ":" + port);
+                System.out.println("[CLIENT] isClientConnected=" + isClientConnected);
             } catch (IOException e) {
+                System.err.println("[CLIENT] ✗ Erreur de connexion: " + e.getMessage());
+                e.printStackTrace();
                 Platform.runLater(() -> {
                     showAlert("Erreur", "Connexion impossible", e.getMessage());
                 });
@@ -567,6 +881,8 @@ public class ChessPingApp extends Application {
         gs.queenLife = config.queenLife;
         gs.knightLife = config.knightLife;
         gs.pawnLife = config.pawnLife;
+        gs.bishopLife = config.bishopLife;
+        gs.rookLife = config.rookLife;
         
         // État du jeu
         gs.whitePaddleX = game.getWhitePlayer().getPaddle().getX();
@@ -620,13 +936,28 @@ public class ChessPingApp extends Application {
         config.queenLife = gameState.queenLife;
         config.knightLife = gameState.knightLife;
         config.pawnLife = gameState.pawnLife;
+        config.bishopLife = gameState.bishopLife;
+        config.rookLife = gameState.rookLife;
         
         // Appliquer l'état du jeu
-        game.getWhitePlayer().getPaddle().setPosition(gameState.whitePaddleX, gameState.whitePaddleY);
-        game.getBlackPlayer().getPaddle().setPosition(gameState.blackPaddleX, gameState.blackPaddleY);
+        // Le client ne met à jour QUE la raquette de l'adversaire (pas la sienne, car il la contrôle localement)
+        if (isWhitePlayer) {
+            // Client joue blanc : mettre à jour UNIQUEMENT la raquette noire (adversaire)
+            game.getBlackPlayer().getPaddle().setPosition(gameState.blackPaddleX, gameState.blackPaddleY);
+        } else {
+            // Client joue noir : mettre à jour UNIQUEMENT la raquette blanche (adversaire)
+            game.getWhitePlayer().getPaddle().setPosition(gameState.whitePaddleX, gameState.whitePaddleY);
+        }
+        
+        // Toujours mettre à jour la balle (le serveur calcule la physique)
         game.getBall().setPosition(gameState.ballX, gameState.ballY);
         game.getBall().setSpeed(gameState.ballSpeedX, gameState.ballSpeedY);
         game.setGameRunning(gameState.gameRunning);
+        
+        // Synchroniser awaitingServe avec l'état du jeu
+        if (gameState.gameRunning) {
+            awaitingServe = false;
+        }
 
         // If the server started the game and this client doesn't have the animation running, start it
         if (gameState.gameRunning && gameTimer == null) {
@@ -644,14 +975,17 @@ public class ChessPingApp extends Application {
 
         // Si l'état du plateau est présent, l'appliquer
         if (gameState.boardPieces != null && gameState.piecesLife != null) {
-            // Si la taille du plateau a changé, recréer le jeu et redimensionner le canvas
+            // Si la taille du plateau a changé, recréer le jeu UNE SEULE FOIS
             double desiredWidth = gameState.pieceLevel * TILE_SIZE;
-            if (canvas.getWidth() != desiredWidth) {
+            if (canvas.getWidth() != desiredWidth && !gameRecreated) {
+                System.out.println("⚠ Redimensionnement du plateau: " + (int)(canvas.getWidth()/TILE_SIZE) + " -> " + gameState.pieceLevel + " pièces");
                 config.pieceLevel = gameState.pieceLevel;
                 // recreate game with new config
                 game = new ChessPingGame(config, TILE_SIZE);
                 // resize canvas to match new board width
                 canvas.setWidth(desiredWidth);
+                gameRecreated = true;  // Ne plus recréer
+                System.out.println("✓ Jeu recréé avec la nouvelle configuration du serveur");
             }
 
             // Clear and place pieces according to incoming state
@@ -700,15 +1034,13 @@ public class ChessPingApp extends Application {
         if (config.networkConfig.getMode() == GameMode.LOCAL) return;
         
         if (isHost) {
-            // Host envoie l'état complet
+            // Host envoie l'état complet à 60 FPS
             if (gameServer != null) {
                 GameState gameState = createGameState();
                 gameServer.broadcastGameState(gameState);
             }
-        } else if (isClientConnected) {
-            // Client envoie seulement sa position de raquette
-            sendPaddleUpdate();
         }
+        // Le CLIENT n'envoie rien ici - il envoie sa raquette dans handleContinuousMovement() seulement quand il bouge
     }
 
     private com.chessping.models.pieces.Piece createPieceFromSymbol(String symbol, boolean isWhite, int row, int col, int life) {
@@ -773,14 +1105,36 @@ public class ChessPingApp extends Application {
     
     private void setupStageCloseHandler(Stage stage) {
         stage.setOnCloseRequest(ev -> {
-            if (gameTimer != null) gameTimer.stop();
+            System.out.println("=== Fermeture de l'application ===");
+            if (gameTimer != null) {
+                gameTimer.stop();
+                System.out.println("✓ AnimationTimer arrêté");
+            }
             if (gameServer != null) {
-                try { gameServer.stop(); } catch (Exception ignored) {}
+                try { 
+                    gameServer.stop();
+                    System.out.println("✓ Serveur de jeu arrêté");
+                    // Attendre que le port soit libéré
+                    Thread.sleep(500);
+                } catch (Exception e) {
+                    System.err.println("Erreur arrêt serveur: " + e.getMessage());
+                }
             }
             if (gameClient != null) {
-                try { gameClient.disconnect(); } catch (Exception ignored) {}
+                try { 
+                    gameClient.disconnect();
+                    System.out.println("✓ Client déconnecté");
+                } catch (Exception e) {
+                    System.err.println("Erreur déconnexion client: " + e.getMessage());
+                }
             }
-            networkExecutor.shutdownNow();
+            try {
+                networkExecutor.shutdownNow();
+                System.out.println("✓ Executor réseau fermé");
+            } catch (Exception e) {
+                System.err.println("Erreur fermeture executor: " + e.getMessage());
+            }
+            System.out.println("=== Application fermée proprement ===");
         });
     }
 

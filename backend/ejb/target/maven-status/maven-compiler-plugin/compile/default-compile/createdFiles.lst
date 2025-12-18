@@ -1,0 +1,4 @@
+com\chessping\ejb\backend\model\GameConfig.class
+com\chessping\ejb\backend\service\GameConfigRemote.class
+com\chessping\ejb\backend\service\GameConfigBean.class
+com\chessping\ejb\backend\dto\GameConfigDTO.class

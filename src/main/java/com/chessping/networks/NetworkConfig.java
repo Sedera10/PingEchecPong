@@ -1,6 +1,10 @@
 package com.chessping.networks;
 
-public class NetworkConfig {
+import java.io.Serializable;
+
+public class NetworkConfig implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     private GameMode mode = GameMode.LOCAL;
     private String serverIp = "localhost";
     private int port = 5555;

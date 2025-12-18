@@ -21,6 +21,7 @@ public class GameClient {
     public void connect() throws IOException {
         socket = new Socket(serverIp, port);
         out = new ObjectOutputStream(socket.getOutputStream());
+        out.flush();  // IMPORTANT: flush pour éviter le deadlock avec ObjectInputStream
         in = new ObjectInputStream(socket.getInputStream());
         
         System.out.println("Connecté au serveur " + serverIp + ":" + port);

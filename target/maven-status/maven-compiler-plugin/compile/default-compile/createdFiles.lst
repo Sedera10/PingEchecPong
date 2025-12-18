@@ -1,3 +1,4 @@
+com\chessping\ejb\EjbConf.class
 com\chessping\networks\NetworkConfig.class
 com\chessping\models\Player.class
 com\chessping\models\pieces\Piece.class
@@ -19,6 +20,7 @@ com\chessping\models\pieces\Knight.class
 com\chessping\models\pieces\Pawn.class
 com\chessping\networks\GameMode.class
 com\chessping\networks\PaddleUpdate.class
+com\chessping\ejb\GameConfigAdapter.class
 com\chessping\networks\GameState.class
 com\chessping\game\Ball.class
 com\chessping\models\pieces\Queen.class
